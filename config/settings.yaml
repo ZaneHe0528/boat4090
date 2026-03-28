@@ -1,0 +1,94 @@
+# River Lane Pilot Configuration File
+# 无人船河道航行配置参数
+
+# 相机配置
+camera:
+  device_id: 0  # GMSL IMX390 Camera
+  width: 1920
+  height: 1080
+  fps: 30
+  exposure: -1  # 自动曝光
+  gain: -1      # 自动增益
+
+# SegFormer模型配置
+segmentation:
+  model_path: "models/segformer_river_lane.onnx"
+  engine_path: "models/segformer_river_lane.engine"
+  input_width: 1024
+  input_height: 512
+  num_classes: 3  # 背景、水面、红线
+  confidence_threshold: 0.5
+  use_tensorrt: true
+  fp16_mode: true
+
+# 颜色阈值检测 (HSV色彩空间)
+color_detection:
+  red_line:
+    lower_hsv: [0, 50, 50]     # 红线下界
+    upper_hsv: [10, 255, 255]  # 红线上界
+    alt_lower_hsv: [170, 50, 50]   # 红色的另一个范围
+    alt_upper_hsv: [180, 255, 255]
+    min_area: 500               # 最小连通域面积
+    morphology_kernel_size: 5   # 形态学操作核大小
+
+  water_surface:
+    lower_hsv: [90, 30, 30]     # 水面下界 (蓝绿色)
+    upper_hsv: [130, 255, 255]  # 水面上界
+    min_area: 1000              # 最小水面区域
+
+# 车道线处理
+lane_processing:
+  roi_height_ratio: 0.6        # 感兴趣区域高度比例
+  roi_width_ratio: 1.0         # 感兴趣区域宽度比例
+  min_lane_width: 50           # 最小车道宽度(像素)
+  max_lane_width: 800          # 最大车道宽度(像素)
+  lane_smoothing_window: 5     # 车道线平滑窗口
+  polynomial_degree: 2         # 拟合多项式阶数
+
+# Pure Pursuit 算法参数
+pure_pursuit:
+  lookahead_distance: 2.0      # 预瞄距离 Ld (米)
+  wheelbase: 1.5               # 船体轴距 (米)
+  min_lookahead: 1.0           # 最小预瞄距离
+  max_lookahead: 5.0           # 最大预瞄距离
+  speed_lookahead_ratio: 0.5   # 速度-预瞄距离比例
+
+# PID控制参数
+pid_controller:
+  steering:
+    kp: 1.2                    # 比例增益
+    ki: 0.1                    # 积分增益
+    kd: 0.05                   # 微分增益
+    max_integral: 10.0         # 积分饱和限制
+    max_output: 30.0           # 最大输出角度(度)
+    
+  speed:
+    kp: 0.8
+    ki: 0.05
+    kd: 0.02
+    max_integral: 5.0
+    max_output: 100.0          # 最大油门百分比
+
+# 船体运动参数
+vehicle:
+  max_speed: 3.0               # 最大速度 (m/s)
+  min_speed: 0.5               # 最小速度 (m/s)
+  target_speed: 1.5            # 目标巡航速度 (m/s)
+  max_steering_angle: 30.0     # 最大舵角 (度)
+  emergency_brake_distance: 2.0 # 紧急制动距离 (米)
+
+# 安全参数
+safety:
+  enable_failsafe: true        # 启用失效保护
+  max_deviation_angle: 45.0    # 最大偏航角(度)
+  obstacle_detection: false    # 障碍物检测(暂未实现)
+  lost_signal_timeout: 2.0     # 信号丢失超时(秒)
+  emergency_stop_enabled: true # 紧急停车
+
+# 调试和日志
+debug:
+  enable_visualization: true    # 启用可视化
+  save_debug_images: false     # 保存调试图像
+  logging_level: "INFO"        # 日志级别: DEBUG, INFO, WARN, ERROR
+  performance_monitoring: true # 性能监控
+  fps_display: true           # 显示FPS

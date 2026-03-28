@@ -1,0 +1,32 @@
+# 训练相关依赖
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.30.0
+accelerate>=0.20.0
+
+# 数据处理
+numpy>=1.24.0
+opencv-python>=4.8.0
+Pillow>=10.0.0
+albumentations>=1.3.0
+labelme>=5.2.0
+
+# 可视化和监控
+matplotlib>=3.7.0
+seaborn>=0.12.0
+tensorboard>=2.13.0
+wandb>=0.15.0
+
+# 工具
+tqdm>=4.65.0
+pyyaml>=6.0
+scikit-learn>=1.3.0
+scikit-image>=0.21.0
+
+# ONNX和部署
+onnx>=1.14.0
+onnxruntime-gpu>=1.15.0
+
+# Jetson相关（在Jetson上安装）
+# pycuda>=2022.1
+# tensorrt>=8.5.0

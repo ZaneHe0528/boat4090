@@ -1,0 +1,76 @@
+# River Lane Pilot - Python Dependencies
+# 无人船河道航行项目依赖包
+
+# 核心深度学习框架
+torch>=1.12.0
+torchvision>=0.13.0
+onnx>=1.12.0
+onnxruntime-gpu>=1.12.0
+
+# TensorRT (需要NVIDIA环境)
+# tensorrt>=8.4.0  # 需要手动安装对应JetPack版本
+
+# 计算机视觉
+opencv-python>=4.6.0
+opencv-contrib-python>=4.6.0
+Pillow>=9.0.0
+scikit-image>=0.19.0
+
+# 数值计算和科学计算
+numpy>=1.21.0
+scipy>=1.8.0
+scikit-learn>=1.1.0
+matplotlib>=3.5.0
+pandas>=1.4.0
+
+# 配置文件处理
+PyYAML>=6.0
+configparser
+argparse
+
+# 数据处理和可视化
+seaborn>=0.11.0
+plotly>=5.6.0
+tqdm>=4.64.0
+
+# 图像处理和几何计算
+shapely>=1.8.0
+networkx>=2.6.0
+
+# 系统和性能
+psutil>=5.9.0
+threading
+multiprocessing
+
+# 开发和测试工具
+pytest>=7.0.0
+pytest-cov>=3.0.0
+black>=22.0.0
+flake8>=4.0.0
+mypy>=0.950
+
+# 日志和调试
+loguru>=0.6.0
+
+# 序列化和网络
+pickle
+json
+requests>=2.27.0
+
+# 时间处理
+python-dateutil>=2.8.0
+
+# 数学库
+sympy>=1.10.0
+
+# 可选：Jupyter支持 (开发调试用)
+jupyter>=1.0.0
+ipython>=8.0.0
+notebook>=6.4.0
+
+# 可选：性能分析
+line_profiler
+memory_profiler
+
+# 可选：GPU加速计算
+cupy-cuda11x  # 根据CUDA版本选择
