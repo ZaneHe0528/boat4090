@@ -1,0 +1,51 @@
+frame,yaw_deg,status
+11_frame_000048.jpg,60.26,ok
+11_frame_000216.jpg,45.94,ok
+11_frame_000456.jpg,46.18,ok
+11_frame_000504.jpg,39.41,ok
+11_frame_000528.jpg,41.09,ok
+11_frame_000600.jpg,37.90,ok
+13_frame_000216.jpg,39.59,ok
+13_frame_000432.jpg,42.03,ok
+13_frame_000528.jpg,38.01,ok
+13_frame_000600.jpg,37.05,ok
+13_frame_000624.jpg,35.87,ok
+13_frame_000648.jpg,23.62,ok
+13_frame_000720.jpg,32.39,ok
+13_frame_000840.jpg,7.51,ok
+15_frame_000000.jpg,23.82,ok
+15_frame_000552.jpg,0.00,boundary count=1, need 2
+17_frame_000528.jpg,27.27,ok
+17_frame_000792.jpg,19.75,ok
+17_frame_000840.jpg,0.00,boundary count=1, need 2
+19_frame_000096.jpg,15.16,ok
+19_frame_000288.jpg,21.89,ok
+19_frame_000792.jpg,29.54,ok
+19_frame_000816.jpg,32.37,ok
+21_frame_000096.jpg,30.30,ok
+21_frame_000144.jpg,30.13,ok
+21_frame_000624.jpg,14.31,ok
+21_frame_000720.jpg,12.15,ok
+23_frame_000024.jpg,-1.09,ok
+23_frame_000048.jpg,0.00,boundary count=1, need 2
+23_frame_000192.jpg,4.02,ok
+23_frame_000528.jpg,14.68,ok
+23_frame_000648.jpg,0.00,boundary count=1, need 2
+23_frame_000768.jpg,21.22,ok
+25_frame_000072.jpg,-1.57,ok
+25_frame_000192.jpg,0.00,boundary count=1, need 2
+25_frame_000216.jpg,10.17,ok
+25_frame_000624.jpg,16.05,ok
+25_frame_000696.jpg,0.00,boundary count=1, need 2
+25_frame_000816.jpg,0.00,boundary count=1, need 2
+27_frame_000000.jpg,27.32,ok
+27_frame_000024.jpg,0.00,boundary count=1, need 2
+27_frame_000144.jpg,37.00,ok
+27_frame_000432.jpg,42.19,ok
+27_frame_000600.jpg,46.54,ok
+9_frame_000024.jpg,49.93,ok
+9_frame_000048.jpg,52.31,ok
+9_frame_000288.jpg,52.55,ok
+9_frame_000312.jpg,41.00,ok
+9_frame_000480.jpg,42.98,ok
+9_frame_000552.jpg,0.00,boundary count=0, need 2

@@ -18,7 +18,7 @@ python scripts/realtime_pilot_v4.py --camera /dev/video2 --model models/segforme
       --images dataset_final/images/test \
       --model  models/segformer_river/best_model.pth \
       --model-name nvidia/segformer-b0-finetuned-ade-512-512 \
-      --output vis_boundary/13.58
+      --output vis_boundary/test
 
   # 同时弹窗查看
   python scripts/Boundary_identification.py \
