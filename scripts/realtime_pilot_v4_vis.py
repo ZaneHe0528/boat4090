@@ -60,17 +60,87 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from visualize_centerline import (
-    BOUNDARY_CLASS,
+    BOUNDARY_CLASS, WATER_CLASS,
     load_segformer, infer_mask,
     collect_images,
     scan_comp_rows, smooth_row_dict,
     _extrapolate_dict,
 )
 
+# ─── 样式常量 ──────────────────────────────────────────────────────────────────
+C_YELLOW   = (0, 255, 255)   # BGR 黄色
+C_CENTER   = (0, 210, 0)     # BGR 亮绿（中线）
+C_SAIL     = (255, 180, 0)   # BGR 蓝色（航行路径）
+C_WARN     = (0, 140, 255)   # BGR 橙色（警戒线）
+DASH_LEN   = 20
+GAP_LEN    = 10
+THICKNESS  = 3
 MIN_AREA   = 30              # 连通域最少像素数，过滤噪声
 
 ROI_TOP_RATIO    = 0.1       # 去除图像最顶部比例（天空噪声）
 WIDTH_OUTLIER_TH = 0.4       # 航道宽度偏差超过此比例的行视为异常
+
+# ─── PIL 中文字体工具 ─────────────────────────────────────────────────────────
+_CN_FONT_CACHE: Dict[int, Any] = {}
+
+
+def _get_pil_font(size: int) -> Any:
+    if size in _CN_FONT_CACHE:
+        return _CN_FONT_CACHE[size]
+    from PIL import ImageFont
+    candidates = [
+        '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+        '/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc',
+        '/usr/share/fonts/truetype/wqy/wqy-microhei.ttc',
+        '/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc',
+        '/usr/share/fonts/truetype/arphic/uming.ttc',
+        '/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf',
+    ]
+    font = None
+    for p in candidates:
+        if Path(p).exists():
+            try:
+                font = ImageFont.truetype(p, size)
+                break
+            except Exception:
+                continue
+    if font is None:
+        font = ImageFont.load_default()
+    _CN_FONT_CACHE[size] = font
+    return font
+
+
+def _cn_text_size(text: str, font_size: int) -> Tuple[int, int]:
+    font = _get_pil_font(font_size)
+    try:
+        bbox = font.getbbox(text)
+        return bbox[2] - bbox[0], bbox[3] - bbox[1]
+    except AttributeError:
+        from PIL import Image, ImageDraw
+        draw = ImageDraw.Draw(Image.new('RGB', (1, 1)))
+        return draw.textsize(text, font=font)
+
+
+def _put_cn_texts(canvas: np.ndarray, items: List[Tuple]) -> None:
+    try:
+        from PIL import Image, ImageDraw
+        img_pil = Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(img_pil)
+        for item in items:
+            text, xy, fs, cbgr = item[:4]
+            stroke_w   = item[4] if len(item) > 4 else 0
+            stroke_bgr = item[5] if len(item) > 5 else (0, 0, 0)
+            crgb = (int(cbgr[2]), int(cbgr[1]), int(cbgr[0]))
+            srgb = (int(stroke_bgr[2]), int(stroke_bgr[1]), int(stroke_bgr[0]))
+            font = _get_pil_font(fs)
+            if stroke_w > 0:
+                draw.text(xy, text, font=font, fill=crgb,
+                          stroke_width=stroke_w, stroke_fill=srgb)
+            else:
+                draw.text(xy, text, font=font, fill=crgb)
+        canvas[:] = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+    except Exception:
+        pass
 
 
 # ─── EMA 时序滤波器 ───────────────────────────────────────────────────────────
@@ -92,6 +162,49 @@ class YawFilter:
 
     def reset(self):
         self._prev = None
+
+
+# ─── 黄色虚线绘制 ──────────────────────────────────────────────────────────────
+
+def _draw_dashed_line(
+    canvas: np.ndarray,
+    pts: List[Tuple[int, int]],
+    color: Tuple[int, int, int] = C_YELLOW,
+    thickness: int = THICKNESS,
+    dash: int = DASH_LEN,
+    gap: int = GAP_LEN,
+) -> None:
+    """沿折线点序列绘制虚线。"""
+    if len(pts) < 2:
+        return
+    drawing = True
+    seg_remain = dash
+
+    for i in range(1, len(pts)):
+        p1 = np.array(pts[i - 1], dtype=np.float64)
+        p2 = np.array(pts[i],     dtype=np.float64)
+        seg_len = float(np.linalg.norm(p2 - p1))
+        if seg_len < 1e-3:
+            continue
+        d   = (p2 - p1) / seg_len
+        pos = 0.0
+
+        while pos < seg_len:
+            step = min(seg_remain, seg_len - pos)
+            q1   = p1 + d * pos
+            q2   = p1 + d * (pos + step)
+            if drawing:
+                cv2.line(
+                    canvas,
+                    (int(round(q1[0])), int(round(q1[1]))),
+                    (int(round(q2[0])), int(round(q2[1]))),
+                    color, thickness, cv2.LINE_AA,
+                )
+            pos        += step
+            seg_remain -= step
+            if seg_remain <= 0:
+                drawing    = not drawing
+                seg_remain = dash if drawing else gap
 
 
 # ─── 边界折线提取 ──────────────────────────────────────────────────────────────
@@ -233,9 +346,10 @@ def process_frame(
       2. 计算中心线
       3. 构建船头→中线的平滑航行轨迹
       4. 计算偏航角
-    返回: (原始图像, 控制信号字典)
+    返回: (可视化图像, 控制信号字典)
     """
     h, w = img_bgr.shape[:2]
+    canvas = img_bgr.copy()
 
     empty_result = {
         'yaw_deg': 0.0,
@@ -248,10 +362,22 @@ def process_frame(
     # ── 1. 提取左右警戒线 ──
     polylines, n_filtered = extract_boundary_polylines(mask)
 
+    # 边界区域半透明红色底色
+    bnd_mask = (mask == BOUNDARY_CLASS)
+    if bnd_mask.any():
+        tint = canvas.copy()
+        tint[bnd_mask] = np.clip(
+            tint[bnd_mask].astype(np.int32) + np.array([0, 0, 100], np.int32),
+            0, 255,
+        ).astype(np.uint8)
+        cv2.addWeighted(tint, 0.55, canvas, 0.45, 0, canvas)
+
     if len(polylines) != 2:
+        for pts in polylines:
+            _draw_dashed_line(canvas, pts, C_YELLOW)
         empty_result['n_filtered'] = n_filtered
         empty_result['status'] = f'boundary count={len(polylines)}, need 2'
-        return img_bgr, empty_result
+        return canvas, empty_result
 
     # ── 2. 区分左右 ──
     avg_x = [sum(p[0] for p in pts) / len(pts) for pts in polylines]
@@ -270,7 +396,7 @@ def process_frame(
     if len(all_ys) < 2:
         empty_result['n_filtered'] = n_filtered
         empty_result['status'] = 'too few boundary rows'
-        return img_bgr, empty_result
+        return canvas, empty_result
 
     y_min_u, y_max_u = all_ys[0], all_ys[-1]
     left_dense  = _extrapolate_dict(left_dict,  y_min_u, y_max_u)
@@ -280,7 +406,7 @@ def process_frame(
     if len(overlap_ys) < 3:
         empty_result['n_filtered'] = n_filtered
         empty_result['status'] = 'overlap rows < 3'
-        return img_bgr, empty_result
+        return canvas, empty_result
 
     # ── 5. 异常宽度过滤 ──
     width_dict = {y: right_dense[y] - left_dense[y] for y in overlap_ys}
@@ -293,7 +419,7 @@ def process_frame(
     if mean_width < 10:
         empty_result['n_filtered'] = n_filtered
         empty_result['status'] = 'channel too narrow'
-        return img_bgr, empty_result
+        return canvas, empty_result
 
     valid_ys = [
         y for y in overlap_ys
@@ -303,7 +429,7 @@ def process_frame(
     if len(valid_ys) < 3:
         empty_result['n_filtered'] = n_filtered
         empty_result['status'] = 'too few valid rows after width filter'
-        return img_bgr, empty_result
+        return canvas, empty_result
 
     # ── 6. 逐行取中点 → 中线（按 y 降序 = 从近到远）──
     center_pts = [
@@ -349,6 +475,12 @@ def process_frame(
     if yaw_filter is not None:
         yaw_deg = yaw_filter.update(yaw_deg)
 
+    # ── 10. 可视化 ──
+    _draw_navigation_overlay(
+        canvas, left_dense, right_dense, valid_ys,
+        center_pts, sailing_path, yaw_deg,
+    )
+
     result = {
         'yaw_deg': round(yaw_deg, 2),
         'status': 'ok',
@@ -356,7 +488,133 @@ def process_frame(
         'center_pts': center_pts,
         'path_pts': sailing_path,
     }
-    return img_bgr, result
+    return canvas, result
+
+
+# ─── 可视化叠加层 ──────────────────────────────────────────────────────────────
+
+def _draw_navigation_overlay(
+    canvas: np.ndarray,
+    left_dense: dict,
+    right_dense: dict,
+    valid_ys: list,
+    center_pts: List[Tuple[int, int]],
+    sailing_path: List[Tuple[int, int]],
+    yaw_deg: float,
+) -> None:
+    """
+    叠加：走廊填充、警戒线、中线、航行路径、船位标记、转向条、HUD。
+    """
+    h, w = canvas.shape[:2]
+
+    # ① 走廊半透明绿色填充
+    if len(valid_ys) >= 2:
+        fill_layer = canvas.copy()
+        for y in valid_ys:
+            xl = max(0, int(left_dense[y]))
+            xr = min(w - 1, int(right_dense[y]))
+            if xr > xl:
+                cv2.line(fill_layer, (xl, y), (xr, y), (0, 180, 60), 1)
+        cv2.addWeighted(fill_layer, 0.25, canvas, 0.75, 0, canvas)
+
+    # ② 左右警戒线（橙色粗实线）
+    if valid_ys:
+        left_line  = [(int(left_dense[y]),  y) for y in sorted(valid_ys)]
+        right_line = [(int(right_dense[y]), y) for y in sorted(valid_ys)]
+        for pts in [left_line, right_line]:
+            for i in range(1, len(pts)):
+                cv2.line(canvas, pts[i-1], pts[i], C_WARN, 3, cv2.LINE_AA)
+
+    # ③ 中线白色虚线
+    if len(center_pts) >= 2:
+        _draw_dashed_line(canvas, center_pts, (200, 200, 200), 1)
+
+    # ④ 蓝色航行路径（粗线 + 方向箭头）
+    if len(sailing_path) >= 2:
+        for i in range(1, len(sailing_path)):
+            cv2.line(canvas, sailing_path[i-1], sailing_path[i],
+                     (255, 255, 255), 5, cv2.LINE_AA)
+        for i in range(1, len(sailing_path)):
+            cv2.line(canvas, sailing_path[i-1], sailing_path[i],
+                     C_SAIL, 3, cv2.LINE_AA)
+        arrow_step = max(3, len(sailing_path) // 6)
+        for i in range(0, len(sailing_path) - arrow_step, arrow_step):
+            cv2.arrowedLine(canvas, sailing_path[i], sailing_path[i + arrow_step],
+                            C_SAIL, 2, cv2.LINE_AA, tipLength=0.25)
+
+    # ⑤ 船位标记（底部中心三角形）
+    boat_cx, boat_cy = w // 2, h - 12
+    boat_pts = np.array([
+        [boat_cx, boat_cy - 18],
+        [boat_cx - 10, boat_cy + 4],
+        [boat_cx + 10, boat_cy + 4],
+    ], np.int32)
+    cv2.fillPoly(canvas, [boat_pts], (0, 220, 255))
+    cv2.polylines(canvas, [boat_pts], True, (255, 255, 255), 1)
+
+    # ⑥ 转向指示条
+    _draw_steering_bar(canvas, yaw_deg, w, h)
+
+    # ⑦ HUD
+    _draw_hud(canvas, yaw_deg, w, h)
+
+
+def _draw_steering_bar(
+    canvas: np.ndarray, yaw_deg: float, w: int, h: int,
+    max_steer: float = 90.0,
+) -> None:
+    bar_w, bar_h = 200, 32
+    x0 = w // 2 - bar_w // 2
+    y0 = h - bar_h - 4
+
+    overlay = canvas.copy()
+    cv2.rectangle(overlay, (x0, y0), (x0 + bar_w, y0 + bar_h), (30, 30, 30), -1)
+    cv2.addWeighted(overlay, 0.7, canvas, 0.3, 0, canvas)
+    cv2.rectangle(canvas, (x0, y0), (x0 + bar_w, y0 + bar_h), (120, 120, 120), 1)
+
+    mid_x = x0 + bar_w // 2
+    cv2.line(canvas, (mid_x, y0 + 4), (mid_x, y0 + bar_h - 4), (180, 180, 180), 1)
+
+    ratio = max(-1.0, min(1.0, yaw_deg / max_steer))
+    fill_len = int(abs(ratio) * (bar_w // 2 - 4))
+    if ratio > 0:
+        cv2.rectangle(canvas, (mid_x, y0 + 5),
+                      (mid_x + fill_len, y0 + bar_h - 5), (0, 100, 255), -1)
+    elif ratio < 0:
+        cv2.rectangle(canvas, (mid_x - fill_len, y0 + 5),
+                      (mid_x, y0 + bar_h - 5), (255, 180, 0), -1)
+
+    if abs(yaw_deg) < 3:
+        label, col_t = "直行", (0, 255, 120)
+    elif yaw_deg > 0:
+        label, col_t = f"右转 {yaw_deg:.0f}°", (0, 100, 255)
+    else:
+        label, col_t = f"左转 {-yaw_deg:.0f}°", (255, 200, 0)
+
+    fs_bar = 15
+    tw, th = _cn_text_size(label, fs_bar)
+    _put_cn_texts(canvas, [(label, (mid_x - tw // 2, y0 + (bar_h - th) // 2),
+                            fs_bar, col_t, 2, (0, 0, 0))])
+
+
+def _draw_hud(
+    canvas: np.ndarray, yaw_deg: float, w: int, h: int,
+) -> None:
+    yaw_col = ((0, 255, 120) if abs(yaw_deg) < 5
+               else (0, 180, 255) if abs(yaw_deg) < 15
+               else (0, 80, 255))
+    yaw_dir = "右偏" if yaw_deg > 0 else "左偏" if yaw_deg < 0 else "直行"
+    yaw_txt = f"偏航 {yaw_dir} {abs(yaw_deg):.1f}°"
+    s_txt = "导航中"
+    s_col = (0, 230, 80)
+
+    fs1 = 18
+    ts_w, _ = _cn_text_size(s_txt, fs1)
+
+    _put_cn_texts(canvas, [
+        (yaw_txt, (8, 6),            fs1, yaw_col, 2, (0, 0, 0)),
+        (s_txt,   (w - ts_w - 8, 6), fs1, s_col,   2, (0, 0, 0)),
+    ])
 
 
 # ─── MAVROS setpoint_velocity（定频重复上一帧）────────────────────────────────
