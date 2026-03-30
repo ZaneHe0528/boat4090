@@ -132,6 +132,47 @@ def infer_staged(
     return pred
 
 
+def infer_staged_tensorrt(
+    runner,
+    img_bgr: np.ndarray,
+    input_width: int,
+    input_height: int,
+    t_pre: Timer,
+    t_infer: Timer,
+    t_post: Timer,
+) -> np.ndarray:
+    """Use a TensorRT engine for inference and keep the rest of the pipeline unchanged."""
+    import torch
+    import torch.nn.functional as F
+
+    mean = np.array([0.485, 0.456, 0.406], np.float32)
+    std  = np.array([0.229, 0.224, 0.225], np.float32)
+    oh, ow = img_bgr.shape[:2]
+
+    _cuda_sync()
+    with t_pre:
+        rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        rsz = cv2.resize(rgb, (input_width, input_height))
+        norm = (rsz.astype(np.float32) / 255.0 - mean) / std
+        tensor = torch.from_numpy(norm).permute(2, 0, 1).unsqueeze(0).contiguous()
+        tensor = tensor.to(device='cuda', dtype=torch.float32)
+    _cuda_sync()
+
+    _cuda_sync()
+    with t_infer:
+        outputs = runner.infer(tensor)
+        logits = outputs[runner.get_primary_output_name()]
+    _cuda_sync()
+
+    _cuda_sync()
+    with t_post:
+        logits = F.interpolate(logits, size=(oh, ow), mode='bilinear', align_corners=False)
+        pred = logits.argmax(1).squeeze(0).to('cpu').numpy().astype(np.uint8)
+    _cuda_sync()
+
+    return pred
+
+
 # ─── 打印分割线 ───────────────────────────────────────────────────────────────
 
 def _sep(char='─', n=62):
@@ -148,9 +189,8 @@ def run_benchmark(
     num_classes: int,
     warmup: int = 10,
     label: str = '',
+    runner = None,
 ) -> None:
-    import torch
-
     yaw_filter = YawFilter(alpha=0.3)
 
     t_pre   = Timer()
@@ -167,17 +207,29 @@ def run_benchmark(
     # ── 预热（避免第一批帧JIT/内存分配计入统计）──
     _w = min(warmup, n)
     for f in frames[:_w]:
-        infer_staged(model, device, f, input_width, input_height, num_classes,
-                     Timer(), Timer(), Timer())
+        if runner is None:
+            infer_staged(model, device, f, input_width, input_height, num_classes,
+                         Timer(), Timer(), Timer())
+        else:
+            infer_staged_tensorrt(
+                runner, f, input_width, input_height,
+                Timer(), Timer(), Timer(),
+            )
 
     # ── 正式计时 ──
     for img in frames:
         with t_total:
-            mask = infer_staged(
-                model, device, img,
-                input_width, input_height, num_classes,
-                t_pre, t_infer, t_post,
-            )
+            if runner is None:
+                mask = infer_staged(
+                    model, device, img,
+                    input_width, input_height, num_classes,
+                    t_pre, t_infer, t_post,
+                )
+            else:
+                mask = infer_staged_tensorrt(
+                    runner, img, input_width, input_height,
+                    t_pre, t_infer, t_post,
+                )
             with t_proc:
                 _, _ = process_frame(img, mask, yaw_filter=yaw_filter)
         _cuda_sync()
@@ -291,7 +343,9 @@ def _print_device_info(device) -> None:
                 print("  [警告] 检测到 NVIDIA GPU，但当前 PyTorch 无法启用 CUDA")
                 print("  [警告] 常见原因：运行在错误的 Python 环境，或 torch CUDA 构建版本与 JetPack/CUDA 驱动不匹配")
         else:
-            idx = device.index if hasattr(device, 'index') else 0
+            idx = 0
+            if not isinstance(device, str) and hasattr(device, 'index') and device.index is not None:
+                idx = device.index
             prop = torch.cuda.get_device_properties(idx)
             mem_gb = prop.total_memory / 1024**3
             print(f"  GPU: {prop.name}")
@@ -311,7 +365,8 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument('--model',        required=True,  help='SegFormer .pth 权重路径')
+    p.add_argument('--model',        default=None,   help='SegFormer .pth 权重路径')
+    p.add_argument('--engine',       default=None,   help='TensorRT engine 路径（可选）')
     p.add_argument('--images',       default=None,   help='真实图片目录（可选，不指定则用随机帧）')
     p.add_argument('--video',        default=None,   help='离线视频路径（可选，与 --images 二选一）')
     p.add_argument('--num-frames',   type=int, default=100, help='测试帧数，默认 100')
@@ -333,11 +388,24 @@ def main():
     if args.frame_stride < 1:
         sys.exit('❌ --frame-stride 必须 >= 1')
 
-    model, device = load_segformer(
-        args.model,
-        num_classes=args.num_classes,
-        model_name=args.model_name,
-    )
+    if not args.model and not args.engine:
+        sys.exit('❌ --model 和 --engine 至少指定一个')
+
+    model = None
+    device = None
+    runner = None
+    if args.engine:
+        from tensorrt_runtime import TensorRTRunner
+        import torch
+
+        runner = TensorRTRunner(args.engine)
+        device = torch.device('cuda')
+    else:
+        model, device = load_segformer(
+            args.model,
+            num_classes=args.num_classes,
+            model_name=args.model_name,
+        )
 
     _print_device_info(device)
 
@@ -375,6 +443,7 @@ def main():
             num_classes=args.num_classes,
             warmup=args.warmup,
             label=f'{iw}x{ih}',
+            runner=runner,
         )
 
     print()
