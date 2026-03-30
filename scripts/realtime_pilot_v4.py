@@ -71,6 +71,9 @@ MIN_AREA   = 30              # 连通域最少像素数，过滤噪声
 
 ROI_TOP_RATIO    = 0.1       # 去除图像最顶部比例（天空噪声）
 WIDTH_OUTLIER_TH = 0.4       # 航道宽度偏差超过此比例的行视为异常
+BOUNDARY_SMOOTH_WINDOW = 5   # 边界逐行平滑窗口
+CENTER_SMOOTH_WINDOW   = 7   # 中线 x 坐标平滑窗口
+POSTPROC_MASK_WIDTH    = 640 # 后处理计算宽度上限
 
 
 # ─── EMA 时序滤波器 ───────────────────────────────────────────────────────────
@@ -101,8 +104,58 @@ def _polyline_side(pts: List[Tuple[int, int]], img_w: int) -> str:
     return 'left' if mean_x < img_w / 2 else 'right'
 
 
-def _min_y(pts: List[Tuple[int, int]]) -> int:
-    return min(p[1] for p in pts)
+def _smooth_centerline_points(
+    center_pts: List[Tuple[int, int]],
+    window: int = CENTER_SMOOTH_WINDOW,
+) -> List[Tuple[int, int]]:
+    """仅平滑 x 坐标，避免每帧运行 SciPy 样条。"""
+    if len(center_pts) < 3:
+        return center_pts
+
+    xs = np.array([pt[0] for pt in center_pts], dtype=np.float32)
+    ys = [pt[1] for pt in center_pts]
+
+    k = min(window, len(center_pts))
+    if k % 2 == 0:
+        k -= 1
+    if k <= 1:
+        return center_pts
+
+    pad = k // 2
+    kernel = np.ones(k, dtype=np.float32) / float(k)
+    xs_pad = np.pad(xs, (pad, pad), mode='edge')
+    xs_smooth = np.convolve(xs_pad, kernel, mode='valid')
+    return [(int(round(float(x))), y) for x, y in zip(xs_smooth, ys)]
+
+
+def _prepare_postprocess_mask(
+    mask: np.ndarray,
+    max_width: int = POSTPROC_MASK_WIDTH,
+) -> Tuple[np.ndarray, float, float]:
+    """将 mask 缩到较低分辨率用于后处理，并返回回映射缩放系数。"""
+    h, w = mask.shape[:2]
+    proc_w = min(int(max_width), int(w))
+    if proc_w <= 0 or proc_w == w:
+        return mask, 1.0, 1.0
+
+    proc_h = max(1, int(round(h * proc_w / w)))
+    proc_mask = cv2.resize(mask, (proc_w, proc_h), interpolation=cv2.INTER_NEAREST)
+    scale_x = float(w) / float(proc_w)
+    scale_y = float(h) / float(proc_h)
+    return proc_mask, scale_x, scale_y
+
+
+def _scale_points_to_image(
+    pts: List[Tuple[int, int]],
+    scale_x: float,
+    scale_y: float,
+) -> List[Tuple[int, int]]:
+    if scale_x == 1.0 and scale_y == 1.0:
+        return pts
+    return [
+        (int(round(x * scale_x)), int(round(y * scale_y)))
+        for x, y in pts
+    ]
 
 
 def extract_boundary_polylines(
@@ -127,7 +180,7 @@ def extract_boundary_polylines(
             continue
         comp_mask = (labels == lid)
         row_dict  = scan_comp_rows(comp_mask)
-        row_dict  = smooth_row_dict(row_dict, window=11)
+        row_dict  = smooth_row_dict(row_dict, window=BOUNDARY_SMOOTH_WINDOW)
         pts = [(int(round(x)), y) for y, x in sorted(row_dict.items())]
         if len(pts) >= 2:
             candidates.append(pts)
@@ -151,7 +204,7 @@ def extract_boundary_polylines(
                 for x, y in pts:
                     merged.setdefault(y, []).append(float(x))
             row_dict = {y: float(np.median(xs)) for y, xs in merged.items()}
-            row_dict = smooth_row_dict(row_dict, window=11)
+            row_dict = smooth_row_dict(row_dict, window=BOUNDARY_SMOOTH_WINDOW)
             merged_pts = [(int(round(x)), y) for y, x in sorted(row_dict.items())]
             if len(merged_pts) >= 2:
                 polylines.append(merged_pts)
@@ -169,7 +222,7 @@ def _build_sailing_path(
     n_interp: int = 30,
 ) -> List[Tuple[int, int]]:
     """
-    从船头位置（图像底部中心）到中线起点做样条平滑过渡，
+    从船头位置（图像底部中心）到中线起点做线性过渡，
     拼接成完整航行路径。
     center_pts: 中线点列表，按 y 降序（[0]=最近端, y 最大）。
     """
@@ -179,44 +232,15 @@ def _build_sailing_path(
     if abs(cl_y - boat_y) < 5 and abs(cl_x - boat_x) < 5:
         return [(boat_x, boat_y)] + center_pts
 
-    try:
-        from scipy.interpolate import CubicSpline
-        n_cl = min(5, len(center_pts))
-        ctrl_ys = [float(boat_y)] + [float(center_pts[i][1]) for i in range(n_cl)]
-        ctrl_xs = [float(boat_x)] + [float(center_pts[i][0]) for i in range(n_cl)]
-
-        clean_ys, clean_xs = [ctrl_ys[0]], [ctrl_xs[0]]
-        for yy, xx in zip(ctrl_ys[1:], ctrl_xs[1:]):
-            if yy < clean_ys[-1]:
-                clean_ys.append(yy)
-                clean_xs.append(xx)
-
-        if len(clean_ys) < 3:
-            return [(boat_x, boat_y)] + center_pts
-
-        rev_ys = list(reversed(clean_ys))
-        rev_xs = list(reversed(clean_xs))
-        cs = CubicSpline(rev_ys, rev_xs, bc_type='natural')
-
-        trans_ys = np.linspace(cl_y, boat_y, n_interp + 2)
-        trans_xs = cs(trans_ys)
-
-        transition = [
-            (int(round(float(x))), int(round(float(y))))
-            for x, y in zip(reversed(trans_xs), reversed(trans_ys))
-        ]
-        return transition + center_pts[1:]
-
-    except Exception:
-        n = n_interp
-        path = []
-        for i in range(n + 1):
-            t = i / n
-            x = int(round(boat_x + t * (cl_x - boat_x)))
-            y = int(round(boat_y + t * (cl_y - boat_y)))
-            path.append((x, y))
-        path += center_pts[1:]
-        return path
+    n = n_interp
+    path = []
+    for i in range(n + 1):
+        t = i / n
+        x = int(round(boat_x + t * (cl_x - boat_x)))
+        y = int(round(boat_y + t * (cl_y - boat_y)))
+        path.append((x, y))
+    path += center_pts[1:]
+    return path
 
 
 # ─── 单帧核心处理：警戒线 → 中线 → 航行轨迹 → 偏航角 ─────────────────────────
@@ -236,6 +260,8 @@ def process_frame(
     返回: (原始图像, 控制信号字典)
     """
     h, w = img_bgr.shape[:2]
+    proc_mask, scale_x, scale_y = _prepare_postprocess_mask(mask)
+    proc_h, proc_w = proc_mask.shape[:2]
 
     empty_result = {
         'yaw_deg': 0.0,
@@ -246,7 +272,7 @@ def process_frame(
     }
 
     # ── 1. 提取左右警戒线 ──
-    polylines, n_filtered = extract_boundary_polylines(mask)
+    polylines, n_filtered = extract_boundary_polylines(proc_mask)
 
     if len(polylines) != 2:
         empty_result['n_filtered'] = n_filtered
@@ -261,7 +287,7 @@ def process_frame(
         left_pts, right_pts = polylines[1], polylines[0]
 
     # ── 3. 构建行字典 ──
-    sky_cut = int(h * roi_top_ratio)
+    sky_cut = int(proc_h * roi_top_ratio)
     left_dict  = {y: float(x) for x, y in left_pts  if y >= sky_cut}
     right_dict = {y: float(x) for x, y in right_pts if y >= sky_cut}
 
@@ -311,26 +337,17 @@ def process_frame(
         for y in sorted(valid_ys, reverse=True)
     ]
 
-    # ── 7. 样条平滑中线 ──
-    if len(center_pts) >= 5:
-        try:
-            from scipy.interpolate import splprep, splev
-            pts_arr = np.array(center_pts, dtype=np.float64)
-            tck, _ = splprep([pts_arr[:, 0], pts_arr[:, 1]],
-                             s=len(center_pts) * 2, k=3)
-            u_new = np.linspace(0, 1, len(center_pts))
-            xs, ys = splev(u_new, tck)
-            center_pts = [
-                (int(round(float(x))), int(round(float(y))))
-                for x, y in zip(xs, ys)
-            ]
-        except Exception:
-            pass
+    # ── 7. 轻量平滑中线 ──
+    center_pts = _smooth_centerline_points(center_pts)
 
     # ── 8. 构建航行路径：船头 → 平滑过渡 → 中线 ──
-    sailing_path = _build_sailing_path(center_pts, w, h)
+    sailing_path = _build_sailing_path(center_pts, proc_w, proc_h)
 
-    # ── 9. 计算偏航角 ──
+    # ── 9. 回映射到原图坐标系，再计算偏航角 ──
+    center_pts = _scale_points_to_image(center_pts, scale_x, scale_y)
+    sailing_path = _scale_points_to_image(sailing_path, scale_x, scale_y)
+
+    # ── 10. 计算偏航角 ──
     if len(sailing_path) >= 5:
         look_idx = min(5, len(sailing_path) // 4)
         dx = float(sailing_path[look_idx][0] - sailing_path[0][0])
