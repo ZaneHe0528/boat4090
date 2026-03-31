@@ -33,13 +33,32 @@ python scripts/benchmark_fps.py \
   --num-frames 300 \
   --warmup 30 \
   --input-sizes 640
+
+
+
+
+
+
+
+process_frame 的细分计时
+conda run -n boat python scripts/benchmark_fps.py \
+  --engine models/segformer_river/segformer_b0_640x384_fp16.engine \
+  --video video.mp4 \
+  --num-frames 300 \
+  --warmup 30 \
+  --input-sizes 640 \
+  --detailed-timing
 """
+
+
+
+
 
 import argparse
 import sys
 import time
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 
 import cv2
 import numpy as np
@@ -77,6 +96,10 @@ class Timer:
         return 1.0 / m if m > 0 else 0.0
 
 
+def _make_timer_group(names: List[str]) -> Dict[str, Timer]:
+    return {name: Timer() for name in names}
+
+
 # ─── GPU 同步工具 ─────────────────────────────────────────────────────────────
 
 def _cuda_sync():
@@ -94,6 +117,7 @@ def infer_staged(
     model, device, img_bgr: np.ndarray,
     input_width: int, input_height: int, num_classes: int,
     t_pre: Timer, t_infer: Timer, t_post: Timer,
+    post_stage_timers: Optional[Dict[str, Timer]] = None,
 ) -> np.ndarray:
     """分阶段计时推理，返回 mask。"""
     import torch
@@ -123,10 +147,18 @@ def infer_staged(
     _cuda_sync()
     with t_post:
         with torch.no_grad():
-            logits = F.interpolate(
-                logits, size=(oh, ow), mode='bilinear', align_corners=False,
-            )
-            pred = logits.argmax(1).squeeze(0).cpu().numpy().astype(np.uint8)
+            if post_stage_timers is None:
+                logits = F.interpolate(
+                    logits, size=(oh, ow), mode='bilinear', align_corners=False,
+                )
+                pred = logits.argmax(1).squeeze(0).cpu().numpy().astype(np.uint8)
+            else:
+                with post_stage_timers['post_resize']:
+                    logits = F.interpolate(
+                        logits, size=(oh, ow), mode='bilinear', align_corners=False,
+                    )
+                with post_stage_timers['post_argmax_cpu']:
+                    pred = logits.argmax(1).squeeze(0).cpu().numpy().astype(np.uint8)
     _cuda_sync()
 
     return pred
@@ -140,6 +172,7 @@ def infer_staged_tensorrt(
     t_pre: Timer,
     t_infer: Timer,
     t_post: Timer,
+    post_stage_timers: Optional[Dict[str, Timer]] = None,
 ) -> np.ndarray:
     """Use a TensorRT engine for inference and keep the rest of the pipeline unchanged."""
     import torch
@@ -166,8 +199,14 @@ def infer_staged_tensorrt(
 
     _cuda_sync()
     with t_post:
-        logits = F.interpolate(logits, size=(oh, ow), mode='bilinear', align_corners=False)
-        pred = logits.argmax(1).squeeze(0).to('cpu').numpy().astype(np.uint8)
+        if post_stage_timers is None:
+            logits = F.interpolate(logits, size=(oh, ow), mode='bilinear', align_corners=False)
+            pred = logits.argmax(1).squeeze(0).to('cpu').numpy().astype(np.uint8)
+        else:
+            with post_stage_timers['post_resize']:
+                logits = F.interpolate(logits, size=(oh, ow), mode='bilinear', align_corners=False)
+            with post_stage_timers['post_argmax_cpu']:
+                pred = logits.argmax(1).squeeze(0).to('cpu').numpy().astype(np.uint8)
     _cuda_sync()
 
     return pred
@@ -190,6 +229,7 @@ def run_benchmark(
     warmup: int = 10,
     label: str = '',
     runner = None,
+    detailed_timing: bool = False,
 ) -> None:
     yaw_filter = YawFilter(alpha=0.3)
 
@@ -198,6 +238,18 @@ def run_benchmark(
     t_post  = Timer()
     t_proc  = Timer()
     t_total = Timer()
+    post_detail = _make_timer_group([
+        'post_resize',
+        'post_argmax_cpu',
+    ]) if detailed_timing else None
+    proc_detail = _make_timer_group([
+        'prepare_mask',
+        'extract_boundary',
+        'dense_rows',
+        'width_filter',
+        'center_path',
+        'yaw',
+    ]) if detailed_timing else None
 
     n = len(frames)
     print(f"\n[分辨率] 输入 {input_width}×{input_height}  "
@@ -207,13 +259,17 @@ def run_benchmark(
     # ── 预热（避免第一批帧JIT/内存分配计入统计）──
     _w = min(warmup, n)
     for f in frames[:_w]:
+        warmup_post_detail = _make_timer_group([
+            'post_resize',
+            'post_argmax_cpu',
+        ]) if detailed_timing else None
         if runner is None:
             infer_staged(model, device, f, input_width, input_height, num_classes,
-                         Timer(), Timer(), Timer())
+                         Timer(), Timer(), Timer(), warmup_post_detail)
         else:
             infer_staged_tensorrt(
                 runner, f, input_width, input_height,
-                Timer(), Timer(), Timer(),
+                Timer(), Timer(), Timer(), warmup_post_detail,
             )
 
     # ── 正式计时 ──
@@ -223,15 +279,19 @@ def run_benchmark(
                 mask = infer_staged(
                     model, device, img,
                     input_width, input_height, num_classes,
-                    t_pre, t_infer, t_post,
+                    t_pre, t_infer, t_post, post_detail,
                 )
             else:
                 mask = infer_staged_tensorrt(
                     runner, img, input_width, input_height,
-                    t_pre, t_infer, t_post,
+                    t_pre, t_infer, t_post, post_detail,
                 )
             with t_proc:
-                _, _ = process_frame(img, mask, yaw_filter=yaw_filter)
+                _, _ = process_frame(
+                    img, mask,
+                    yaw_filter=yaw_filter,
+                    stage_timers=proc_detail,
+                )
         _cuda_sync()
 
     # ── 打印结果 ──
@@ -260,6 +320,18 @@ def run_benchmark(
     proc_ratio  = t_proc.mean_ms()  / t_total.mean_ms() * 100
     print(f"  瓶颈占比：模型推理 {infer_ratio:.0f}%  |  后处理算法 {proc_ratio:.0f}%")
     _sep()
+
+    if detailed_timing and post_detail is not None and proc_detail is not None:
+        print("  【细分计时】")
+        print(f"    ③a 插值恢复原图      {post_detail['post_resize'].mean_ms():>7.1f} ms")
+        print(f"    ③b argmax+拷回CPU    {post_detail['post_argmax_cpu'].mean_ms():>7.1f} ms")
+        print(f"    ④a 准备低分辨率 mask  {proc_detail['prepare_mask'].mean_ms():>7.1f} ms")
+        print(f"    ④b 连通域/边界提取    {proc_detail['extract_boundary'].mean_ms():>7.1f} ms")
+        print(f"    ④c 稠密行外推        {proc_detail['dense_rows'].mean_ms():>7.1f} ms")
+        print(f"    ④d 宽度过滤          {proc_detail['width_filter'].mean_ms():>7.1f} ms")
+        print(f"    ④e 中线/航迹构建      {proc_detail['center_path'].mean_ms():>7.1f} ms")
+        print(f"    ④f 偏航角计算        {proc_detail['yaw'].mean_ms():>7.1f} ms")
+        _sep()
 
     if fps < target:
         print("  【优化建议】")
@@ -375,6 +447,8 @@ def parse_args():
                    help='视频采样步长；1=逐帧采样，2=每隔 1 帧采 1 帧，默认 1')
     p.add_argument('--input-sizes',  type=int, nargs='+', default=[640],
                    help='推理输入宽度（可指定多个对比），默认 640')
+    p.add_argument('--detailed-timing', action='store_true',
+                   help='拆细打印 ③ 后处理和 ④ process_frame 的子阶段耗时')
     p.add_argument('--num-classes',  type=int, default=3)
     p.add_argument('--model-name',   type=str, default=None)
     return p.parse_args()
@@ -444,6 +518,7 @@ def main():
             warmup=args.warmup,
             label=f'{iw}x{ih}',
             runner=runner,
+            detailed_timing=args.detailed_timing,
         )
 
     print()

@@ -73,6 +73,7 @@ python scripts/realtime_pilot_v4.py --camera /dev/video2 --engine models/segform
 """
 
 import argparse
+from contextlib import nullcontext
 import math
 import sys
 import threading
@@ -362,6 +363,7 @@ def process_frame(
     mask: np.ndarray,
     yaw_filter: Optional[YawFilter] = None,
     roi_top_ratio: float = ROI_TOP_RATIO,
+    stage_timers: Optional[Dict[str, Any]] = None,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """
     处理单帧：
@@ -372,8 +374,16 @@ def process_frame(
     返回: (原始图像, 控制信号字典)
     """
     h, w = img_bgr.shape[:2]
-    proc_mask, scale_x, scale_y = _prepare_postprocess_mask(mask)
-    proc_h, proc_w = proc_mask.shape[:2]
+
+    def _stage(name: str):
+        if stage_timers is None:
+            return nullcontext()
+        timer = stage_timers.get(name)
+        return timer if timer is not None else nullcontext()
+
+    with _stage('prepare_mask'):
+        proc_mask, scale_x, scale_y = _prepare_postprocess_mask(mask)
+        proc_h, proc_w = proc_mask.shape[:2]
 
     empty_result = {
         'yaw_deg': 0.0,
@@ -384,7 +394,8 @@ def process_frame(
     }
 
     # ── 1. 提取左右警戒线 ──
-    polylines, n_filtered = extract_boundary_polylines(proc_mask)
+    with _stage('extract_boundary'):
+        polylines, n_filtered = extract_boundary_polylines(proc_mask)
 
     if len(polylines) != 2:
         empty_result['n_filtered'] = n_filtered
@@ -399,21 +410,23 @@ def process_frame(
         left_pts, right_pts = polylines[1], polylines[0]
 
     # ── 3. 构建行字典 ──
-    sky_cut = int(proc_h * roi_top_ratio)
-    left_dict  = {y: float(x) for x, y in left_pts  if y >= sky_cut}
-    right_dict = {y: float(x) for x, y in right_pts if y >= sky_cut}
+    with _stage('dense_rows'):
+        sky_cut = int(proc_h * roi_top_ratio)
+        left_dict  = {y: float(x) for x, y in left_pts  if y >= sky_cut}
+        right_dict = {y: float(x) for x, y in right_pts if y >= sky_cut}
 
-    # ── 4. 插值 + 外推 → 稠密行覆盖 ──
-    all_ys = sorted(set(left_dict.keys()) | set(right_dict.keys()))
+        # ── 4. 插值 + 外推 → 稠密行覆盖 ──
+        all_ys = sorted(set(left_dict.keys()) | set(right_dict.keys()))
     if len(all_ys) < 2:
         empty_result['n_filtered'] = n_filtered
         empty_result['status'] = 'too few boundary rows'
         return img_bgr, empty_result
 
-    y_min_u, y_max_u = all_ys[0], all_ys[-1]
-    left_dense  = _extrapolate_dict(left_dict,  y_min_u, y_max_u)
-    right_dense = _extrapolate_dict(right_dict, y_min_u, y_max_u)
-    overlap_ys  = sorted(set(left_dense.keys()) & set(right_dense.keys()))
+    with _stage('dense_rows'):
+        y_min_u, y_max_u = all_ys[0], all_ys[-1]
+        left_dense  = _extrapolate_dict(left_dict,  y_min_u, y_max_u)
+        right_dense = _extrapolate_dict(right_dict, y_min_u, y_max_u)
+        overlap_ys  = sorted(set(left_dense.keys()) & set(right_dense.keys()))
 
     if len(overlap_ys) < 3:
         empty_result['n_filtered'] = n_filtered
@@ -421,22 +434,24 @@ def process_frame(
         return img_bgr, empty_result
 
     # ── 5. 异常宽度过滤 ──
-    width_dict = {y: right_dense[y] - left_dense[y] for y in overlap_ys}
-    near_rows = [y for y in overlap_ys
-                 if y >= max(overlap_ys) - (max(overlap_ys) - min(overlap_ys)) * 0.3]
-    if not near_rows:
-        near_rows = overlap_ys
-    mean_width = float(np.mean([width_dict[y] for y in near_rows]))
+    with _stage('width_filter'):
+        width_dict = {y: right_dense[y] - left_dense[y] for y in overlap_ys}
+        near_rows = [y for y in overlap_ys
+                     if y >= max(overlap_ys) - (max(overlap_ys) - min(overlap_ys)) * 0.3]
+        if not near_rows:
+            near_rows = overlap_ys
+        mean_width = float(np.mean([width_dict[y] for y in near_rows]))
 
     if mean_width < 10:
         empty_result['n_filtered'] = n_filtered
         empty_result['status'] = 'channel too narrow'
         return img_bgr, empty_result
 
-    valid_ys = [
-        y for y in overlap_ys
-        if abs(width_dict[y] - mean_width) / mean_width < WIDTH_OUTLIER_TH
-    ]
+    with _stage('width_filter'):
+        valid_ys = [
+            y for y in overlap_ys
+            if abs(width_dict[y] - mean_width) / mean_width < WIDTH_OUTLIER_TH
+        ]
 
     if len(valid_ys) < 3:
         empty_result['n_filtered'] = n_filtered
@@ -444,39 +459,41 @@ def process_frame(
         return img_bgr, empty_result
 
     # ── 6. 逐行取中点 → 中线（按 y 降序 = 从近到远）──
-    center_pts = [
-        (int(round((left_dense[y] + right_dense[y]) / 2.0)), y)
-        for y in sorted(valid_ys, reverse=True)
-    ]
+    with _stage('center_path'):
+        center_pts = [
+            (int(round((left_dense[y] + right_dense[y]) / 2.0)), y)
+            for y in sorted(valid_ys, reverse=True)
+        ]
 
-    # ── 7. 轻量平滑中线 ──
-    center_pts = _smooth_centerline_points(center_pts)
+        # ── 7. 轻量平滑中线 ──
+        center_pts = _smooth_centerline_points(center_pts)
 
-    # ── 8. 构建航行路径：船头 → 平滑过渡 → 中线 ──
-    sailing_path = _build_sailing_path(center_pts, proc_w, proc_h)
+        # ── 8. 构建航行路径：船头 → 平滑过渡 → 中线 ──
+        sailing_path = _build_sailing_path(center_pts, proc_w, proc_h)
 
-    # ── 9. 回映射到原图坐标系，再计算偏航角 ──
-    center_pts = _scale_points_to_image(center_pts, scale_x, scale_y)
-    sailing_path = _scale_points_to_image(sailing_path, scale_x, scale_y)
+        # ── 9. 回映射到原图坐标系，再计算偏航角 ──
+        center_pts = _scale_points_to_image(center_pts, scale_x, scale_y)
+        sailing_path = _scale_points_to_image(sailing_path, scale_x, scale_y)
 
     # ── 10. 计算偏航角 ──
-    if len(sailing_path) >= 5:
-        look_idx = min(5, len(sailing_path) // 4)
-        dx = float(sailing_path[look_idx][0] - sailing_path[0][0])
-        dy = float(sailing_path[0][1] - sailing_path[look_idx][1])
-    elif len(sailing_path) >= 2:
-        dx = float(sailing_path[-1][0] - sailing_path[0][0])
-        dy = float(sailing_path[0][1] - sailing_path[-1][1])
-    else:
-        dx, dy = 0.0, 1.0
+    with _stage('yaw'):
+        if len(sailing_path) >= 5:
+            look_idx = min(5, len(sailing_path) // 4)
+            dx = float(sailing_path[look_idx][0] - sailing_path[0][0])
+            dy = float(sailing_path[0][1] - sailing_path[look_idx][1])
+        elif len(sailing_path) >= 2:
+            dx = float(sailing_path[-1][0] - sailing_path[0][0])
+            dy = float(sailing_path[0][1] - sailing_path[-1][1])
+        else:
+            dx, dy = 0.0, 1.0
 
-    if abs(dx) > 0.1 or abs(dy) > 0.1:
-        yaw_deg = math.degrees(math.atan2(dx, max(dy, 0.1)))
-    else:
-        yaw_deg = 0.0
+        if abs(dx) > 0.1 or abs(dy) > 0.1:
+            yaw_deg = math.degrees(math.atan2(dx, max(dy, 0.1)))
+        else:
+            yaw_deg = 0.0
 
-    if yaw_filter is not None:
-        yaw_deg = yaw_filter.update(yaw_deg)
+        if yaw_filter is not None:
+            yaw_deg = yaw_filter.update(yaw_deg)
 
     result = {
         'yaw_deg': round(yaw_deg, 2),
