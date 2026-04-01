@@ -2,74 +2,29 @@
 """
 警戒线导航脚本 —— 识别两岸警戒线，计算中心线，连接船头生成平滑航行轨迹，
 输出小船偏航角。支持 PyTorch 和 TensorRT 两种推理后端。
+通过 px4_msgs 直接与 PX4 通信，Offboard 速度控制，20Hz 定频发布。
 
-TensorRT优化
-直接跑相机
-conda run -n boat python scripts/realtime_pilot_v4.py \
-  --camera /dev/video2 \
-  --engine models/segformer_river/segformer_b0_640x384_fp16.engine
-
-
-带mavros
-conda run -n boat python scripts/realtime_pilot_v4.py \
-  --camera /dev/video2 \
-  --engine models/segformer_river/segformer_b0_640x384_fp16.engine \
-  --mavros
-
-
-
-
-
-
-
-
-source /home/yanmin/ws_boat/src/boat/boat/.venv/bin/activate
-python scripts/realtime_pilot_v4.py --camera /dev/video2 --model models/segformer_river/best_model.pth --mavros
-python scripts/realtime_pilot_v4.py --camera /dev/video2 --engine models/segformer_river/segformer_b0_640x384_fp16.engine --mavros
-
-运行前请在终端执行（按实际路径修改 venv 与 cusparselt）：
-
-  source .venv/bin/activate
-  export LD_LIBRARY_PATH="/path/to/.venv/lib/python3.10/site-packages/nvidia/cusparselt/lib:${LD_LIBRARY_PATH}"
-
-【模型推理模式】对图片/目录进行推理，输出可视化图片 + 偏航角 CSV：
-
-  python scripts/realtime_pilot_v4.py \
-      --images dataset_final/images/test \
-      --model  models/segformer_river/best_model.pth \
-      --model-name nvidia/segformer-b0-finetuned-ade-512-512 \
-      --output vis_boundary/test
-
-  # 同时弹窗查看
-  python scripts/Boundary_identification.py \
-      --images dataset_final/images/test \
-      --model  models/segformer_river/best_model.pth \
-      --output vis_boundary --show
-
-【实时相机模式】从摄像头读帧，实时输出偏航角：
-  python scripts/realtime_pilot_v4.py \
-      --camera 2 \
-      --model  models/segformer_river/best_model.pth
-
-  # 直接走 TensorRT 引擎
-  python scripts/realtime_pilot_v4.py \
+【直接跑相机（TensorRT）】
+  python scripts/realtime_pilot_jsh.py \
       --camera /dev/video2 \
       --engine models/segformer_river/segformer_b0_640x384_fp16.engine
 
+【PX4 Offboard 控制】0.3 m/s 前进，20Hz 发布 setpoint，1 秒预热后自动解锁：
+  python scripts/realtime_pilot_jsh.py \
+      --camera /dev/video2 \
+      --engine models/segformer_river/segformer_b0_640x384_fp16.engine \
+      --px4
 
-  # 向 MAVROS 发布速度 setpoint（前进 0.5 m/s，角速度由 yaw_deg 换算），并以不低于 --mavros-min-hz
-  # 的频率重复上一帧指令；启动约 --mavros-prepare-delay 秒后自动请求 OFFBOARD 并 arm。
-  # 默认视觉暂时失败时仍保持前进（仅不转向）；若要停船请加 --mavros-stop-when-not-ok。
-  python scripts/realtime_pilot_v4.py \
-      --camera 2 \
+【模型推理模式】对图片/目录进行推理：
+  python scripts/realtime_pilot_jsh.py \
+      --images dataset_final/images/test \
       --model  models/segformer_river/best_model.pth \
-      --mavros
+      --output vis_boundary/test
 
-  # 指定相机设备 + 显示画面
-  python scripts/Boundary_identification.py \
-      --camera /dev/video0 \
-      --model  models/segformer_river/best_model.pth \
-      --show
+【实时相机模式】从摄像头读帧，实时输出偏航角：
+  python scripts/realtime_pilot_jsh.py \
+      --camera /dev/video2 \
+      --engine models/segformer_river/segformer_b0_640x384_fp16.engine
 """
 
 import argparse
@@ -526,212 +481,172 @@ def process_frame(
     return img_bgr, result
 
 
-# ─── MAVROS setpoint_velocity（定频重复上一帧）────────────────────────────────
+# ─── PX4 Offboard 控制器（20Hz 定频发布 setpoint）──────────────────────────────
 
-def _twist_cmd_vel(linear_x: float, yaw_deg: float, max_wz: float):
-    """linear.x 前进速度；angular.z 由 yaw_deg（度）换算为 rad/s 并限幅。"""
-    from geometry_msgs.msg import Twist
-
-    msg = Twist()
-    msg.linear.x = float(linear_x)
-    wz = math.radians(float(yaw_deg))
-    wz = max(-max_wz, min(max_wz, wz))
-    msg.angular.z = wz
-    return msg
-
-
-def _twist_stop():
-    from geometry_msgs.msg import Twist
-
-    return Twist()
-
-
-def _mavros_wait_service(client, timeout_sec: float) -> bool:
-    deadline = time.time() + timeout_sec
-    while time.time() < deadline:
-        if client.wait_for_service(timeout_sec=0.5):
-            return True
-    return False
-
-
-def _mavros_call_blocking(node, client, request, timeout_sec: float = 10.0):
-    """在独立 Executor 线程已 spin 时，用异步调用阻塞等待结果。"""
-    if not _mavros_wait_service(client, min(timeout_sec, 15.0)):
-        return None
-    fut = client.call_async(request)
-    t0 = time.time()
-    while not fut.done() and time.time() - t0 < timeout_sec:
-        time.sleep(0.02)
-    if not fut.done():
-        return None
-    return fut.result()
-
-
-def _mav_result_text(code: Optional[int]) -> str:
-    table = {
-        0: 'ACCEPTED',
-        1: 'TEMPORARILY_REJECTED',
-        2: 'DENIED',
-        3: 'UNSUPPORTED',
-        4: 'FAILED',
-        5: 'IN_PROGRESS',
-        6: 'CANCELLED',
-    }
-    if code is None:
-        return 'NONE'
-    return table.get(int(code), f'UNKNOWN({int(code)})')
-
-
-class _MavrosStateMonitor:
-    """订阅 /mavros/state，提供线程安全状态快照。"""
-
-    def __init__(self, node, topic: str):
-        from mavros_msgs.msg import State
-
-        self._lock = threading.Lock()
-        self.connected = False
-        self.armed = False
-        self.mode = ''
-        self._sub = node.create_subscription(State, topic, self._on_state, 10)
-
-    def _on_state(self, msg) -> None:
-        with self._lock:
-            self.connected = bool(msg.connected)
-            self.armed = bool(msg.armed)
-            self.mode = str(msg.mode)
-
-    def snapshot(self) -> Tuple[bool, bool, str]:
-        with self._lock:
-            return self.connected, self.armed, self.mode
-
-
-def _mavros_wait_connected(state_mon: _MavrosStateMonitor, timeout_sec: float) -> bool:
-    deadline = time.time() + max(0.5, float(timeout_sec))
-    while time.time() < deadline:
-        connected, _, _ = state_mon.snapshot()
-        if connected:
-            return True
-        time.sleep(0.05)
-    return False
-
-
-def _mavros_set_offboard_and_arm(
-    node,
-    state_mon: _MavrosStateMonitor,
-    prepare_delay: float,
-    set_mode_srv: str,
-    arm_srv: str,
-    max_retry: int = 8,
-) -> None:
+class _PX4OffboardController:
     """
-    PX4 进入 OFFBOARD 前需已持续收到 setpoint（由定频 repeater 提供）。
-    顺序：等待 prepare_delay → SetMode(OFFBOARD) → 解锁 arm。
+    通过 px4_msgs 直接与 PX4 通信的 Offboard 控制器。
+    以 20Hz 定频发布 OffboardControlMode + TrajectorySetpoint，
+    推理帧率低时在两帧之间重复上一次指令，保证 Offboard 不掉线。
+    发送 20 帧 setpoint 后自动切 Offboard 模式并解锁。
     """
-    from mavros_msgs.srv import CommandBool, SetMode
 
-    if not _mavros_wait_connected(state_mon, timeout_sec=10.0):
-        print('[MAVROS] ⚠️ 未检测到 FCU 连接（state.connected=False）')
-        print('[MAVROS] 请检查: PX4 是否运行、MAVROS bridge 是否已连接、命名空间是否正确')
-        return
+    CONTROL_HZ = 20
+    FORWARD_SPEED = 0.3
 
-    connected, armed, mode = state_mon.snapshot()
-    print(f'[MAVROS] 初始状态 connected={connected} mode={mode} armed={armed}')
-
-    time.sleep(max(0.0, float(prepare_delay)))
-
-    mode_cli = node.create_client(SetMode, set_mode_srv)
-    arm_cli = node.create_client(CommandBool, arm_srv)
-
-    mode_req = SetMode.Request()
-    mode_req.base_mode = 0
-    mode_req.custom_mode = 'OFFBOARD'
-
-    # 重试到状态真正进入 OFFBOARD，而不仅仅是 service 返回。
-    for attempt in range(1, max_retry + 1):
-        _, _, mode = state_mon.snapshot()
-        if mode == 'OFFBOARD':
-            print('[MAVROS] 当前已是 OFFBOARD')
-            break
-
-        r = _mavros_call_blocking(node, mode_cli, mode_req, timeout_sec=8.0)
-        sent = r is not None and getattr(r, 'mode_sent', False)
-        time.sleep(0.25)
-        _, _, mode = state_mon.snapshot()
-        if sent and mode == 'OFFBOARD':
-            print(f'[MAVROS] 模式切换成功: OFFBOARD（第 {attempt} 次）')
-            break
-
-        print(
-            f'[MAVROS] 设置 OFFBOARD 未生效（第 {attempt}/{max_retry} 次） '
-            f'mode_sent={sent} current_mode={mode}'
+    def __init__(self, node, stop_when_not_ok: bool = False):
+        from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+        from px4_msgs.msg import (
+            OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleAttitude,
         )
-        time.sleep(0.5)
-    else:
-        print('[MAVROS] ⚠️ 未能切换到 OFFBOARD，请检查 setpoint 频率、飞控状态与 PX4 参数')
 
-    arm_req = CommandBool.Request()
-    arm_req.value = True
-
-    for attempt in range(1, max_retry + 1):
-        _, armed, _ = state_mon.snapshot()
-        if armed:
-            print('[MAVROS] 当前已解锁 (armed=True)')
-            break
-
-        r = _mavros_call_blocking(node, arm_cli, arm_req, timeout_sec=8.0)
-        success = r is not None and bool(getattr(r, 'success', False))
-        result_code = getattr(r, 'result', None)
-        time.sleep(0.25)
-        _, armed, mode = state_mon.snapshot()
-        if success and armed:
-            print(f'[MAVROS] 解锁成功（第 {attempt} 次）')
-            break
-        print(
-            f'[MAVROS] 解锁未生效（第 {attempt}/{max_retry} 次） '
-            f'success={success} result={result_code}({_mav_result_text(result_code)}) '
-            f'armed={armed} mode={mode}'
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
         )
-        time.sleep(0.5)
-    else:
-        print('[MAVROS] ⚠️ 未能解锁，请检查 pre-arm、遥控器档位与 COM_RCL_EXCEPT')
 
-    connected, armed, mode = state_mon.snapshot()
-    print(f'[MAVROS] 最终状态 connected={connected} mode={mode} armed={armed}')
-
-
-class _MavrosCmdVelRepeater:
-    """按 min_hz 定时发布，推理慢时在两次推理之间重复上一帧 Twist。"""
-
-    def __init__(self, node, topic: str, min_hz: float):
-        from geometry_msgs.msg import Twist
-
-        self._pub = node.create_publisher(Twist, topic, 10)
+        self._node = node
         self._lock = threading.Lock()
-        self._last = Twist()
-        hz = max(float(min_hz), 1.0)
-        self._timer = node.create_timer(1.0 / hz, self._on_timer)
+        self._yaw_deg = 0.0
+        self._current_yaw = 0.0
+        self._status_ok = True
+        self._stop_when_not_ok = stop_when_not_ok
 
-    def _on_timer(self) -> None:
-        from geometry_msgs.msg import Twist
+        self._offboard_setpoint_counter = 0
+        self._armed = False
+        self._offboard_mode = False
+
+        self._offboard_mode_pub = node.create_publisher(
+            OffboardControlMode, '/fmu/in/offboard_control_mode', qos)
+        self._trajectory_pub = node.create_publisher(
+            TrajectorySetpoint, '/fmu/in/trajectory_setpoint', qos)
+        self._vehicle_cmd_pub = node.create_publisher(
+            VehicleCommand, '/fmu/in/vehicle_command', qos)
+
+        self._attitude_sub = node.create_subscription(
+            VehicleAttitude, '/fmu/out/vehicle_attitude', self._attitude_cb, qos)
+
+        self._timer = node.create_timer(1.0 / self.CONTROL_HZ, self._timer_cb)
+
+    # ── 姿态回调：从四元数提取当前偏航角 ──
+
+    def _attitude_cb(self, msg):
+        w, x, y, z = msg.q
+        siny_cosp = 2.0 * (w * z + x * y)
+        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+        with self._lock:
+            self._current_yaw = math.atan2(siny_cosp, cosy_cosp)
+
+    # ── 20Hz 定时回调 ──
+
+    def _timer_cb(self):
+        self._publish_offboard_control_mode()
+        self._publish_trajectory_setpoint()
+
+        if self._offboard_setpoint_counter < 20:
+            self._offboard_setpoint_counter += 1
+
+        if self._offboard_setpoint_counter == 20:
+            if not self._offboard_mode:
+                self._set_offboard_mode()
+                self._offboard_mode = True
+            if not self._armed:
+                self._arm()
+                self._armed = True
+
+    # ── 发布 OffboardControlMode ──
+
+    def _publish_offboard_control_mode(self):
+        from px4_msgs.msg import OffboardControlMode
+        msg = OffboardControlMode()
+        msg.timestamp = int(self._node.get_clock().now().nanoseconds / 1000)
+        msg.position = False
+        msg.velocity = True
+        msg.acceleration = False
+        msg.attitude = False
+        msg.body_rate = False
+        msg.thrust_and_torque = False
+        msg.direct_actuator = False
+        self._offboard_mode_pub.publish(msg)
+
+    # ── 发布 TrajectorySetpoint（速度 + 偏航角）──
+
+    def _publish_trajectory_setpoint(self):
+        from px4_msgs.msg import TrajectorySetpoint
+        msg = TrajectorySetpoint()
+        msg.timestamp = int(self._node.get_clock().now().nanoseconds / 1000)
 
         with self._lock:
-            msg = Twist()
-            msg.linear.x = self._last.linear.x
-            msg.linear.y = self._last.linear.y
-            msg.linear.z = self._last.linear.z
-            msg.angular.x = self._last.angular.x
-            msg.angular.y = self._last.angular.y
-            msg.angular.z = self._last.angular.z
-        self._pub.publish(msg)
+            current_yaw = self._current_yaw
+            yaw_deg = self._yaw_deg
+            status_ok = self._status_ok
 
-    def update(self, twist) -> None:
+        if not status_ok and self._stop_when_not_ok:
+            speed = 0.0
+            yaw_offset = 0.0
+        elif not status_ok:
+            speed = self.FORWARD_SPEED
+            yaw_offset = 0.0
+        else:
+            speed = self.FORWARD_SPEED
+            yaw_offset = math.radians(yaw_deg)
+
+        absolute_yaw = self._normalize_angle(current_yaw + yaw_offset)
+
+        msg.velocity[0] = speed * math.cos(absolute_yaw)
+        msg.velocity[1] = speed * math.sin(absolute_yaw)
+        msg.velocity[2] = 0.0
+        msg.position[0] = float('nan')
+        msg.position[1] = float('nan')
+        msg.position[2] = float('nan')
+        msg.acceleration[0] = float('nan')
+        msg.acceleration[1] = float('nan')
+        msg.acceleration[2] = float('nan')
+        msg.yaw = absolute_yaw
+        msg.yawspeed = float('nan')
+        self._trajectory_pub.publish(msg)
+
+    @staticmethod
+    def _normalize_angle(angle: float) -> float:
+        return math.atan2(math.sin(angle), math.cos(angle))
+
+    # ── VehicleCommand 发布 ──
+
+    def _publish_vehicle_command(self, command, **kwargs):
+        from px4_msgs.msg import VehicleCommand
+        msg = VehicleCommand()
+        msg.timestamp = int(self._node.get_clock().now().nanoseconds / 1000)
+        msg.command = command
+        msg.target_system = 1
+        msg.target_component = 1
+        msg.source_system = 1
+        msg.source_component = 1
+        msg.from_external = True
+        for field, value in kwargs.items():
+            setattr(msg, field, value)
+        self._vehicle_cmd_pub.publish(msg)
+
+    def _arm(self):
+        from px4_msgs.msg import VehicleCommand
+        self._publish_vehicle_command(
+            VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=1.0)
+        self._node.get_logger().info('发送解锁指令')
+
+    def _set_offboard_mode(self):
+        from px4_msgs.msg import VehicleCommand
+        self._publish_vehicle_command(
+            VehicleCommand.VEHICLE_CMD_DO_SET_MODE,
+            param1=1.0, param2=6.0)
+        self._node.get_logger().info('切换到 Offboard 模式')
+
+    # ── 外部接口：推理线程更新偏航角 ──
+
+    def update(self, yaw_deg: float, status_ok: bool) -> None:
         with self._lock:
-            self._last.linear.x = twist.linear.x
-            self._last.linear.y = twist.linear.y
-            self._last.linear.z = twist.linear.z
-            self._last.angular.x = twist.angular.x
-            self._last.angular.y = twist.angular.y
-            self._last.angular.z = twist.angular.z
+            self._yaw_deg = yaw_deg
+            self._status_ok = status_ok
 
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
@@ -765,31 +680,11 @@ def parse_args():
     p.add_argument('--roi-top',     type=float, default=0.1,
                    help='天空噪声截断比例，默认 0.1')
 
-    # MAVROS（仅实时相机模式）
-    p.add_argument('--mavros', action='store_true',
-                   help='向 MAVROS 发布 setpoint_velocity/cmd_vel_unstamped (Twist)')
-    p.add_argument('--mavros-topic', type=str,
-                   default='/mavros/setpoint_velocity/cmd_vel_unstamped',
-                   help='cmd_vel 话题全名')
-    p.add_argument('--mavros-state-topic', type=str,
-                   default='/mavros/state',
-                   help='mavros state 话题全名（用于 connected/mode/armed 监控）')
-    p.add_argument('--mavros-set-mode-srv', type=str,
-                   default='/mavros/set_mode',
-                   help='SetMode 服务全名')
-    p.add_argument('--mavros-arm-srv', type=str,
-                   default='/mavros/cmd/arming',
-                   help='解锁 CommandBool 服务全名')
-    p.add_argument('--mavros-min-hz', type=float, default=20.0,
-                   help='最低发布频率 (Hz)；推理低于此频率时重复发送上一帧指令')
-    p.add_argument('--mavros-linear-x', type=float, default=0.5,
-                   help='前进速度 linear.x (m/s)，默认 0.5')
-    p.add_argument('--mavros-max-wz', type=float, default=1.0,
-                   help='由 yaw_deg 换算的角速度限幅 |angular.z| (rad/s)')
-    p.add_argument('--mavros-prepare-delay', type=float, default=2.5,
-                   help='开始发 setpoint 后等待多久再请求 OFFBOARD+解锁（秒），满足 PX4 预热')
-    p.add_argument('--mavros-stop-when-not-ok', action='store_true',
-                   help='视觉 status≠ok 时发布零速度；默认关闭（非 ok 时仍前进 linear.x，仅角速度置 0）')
+    # PX4 Offboard 控制（仅实时相机模式）
+    p.add_argument('--px4', action='store_true',
+                   help='启用 PX4 Offboard 控制（通过 px4_msgs 直接通信，0.3 m/s 前进，20Hz 发布）')
+    p.add_argument('--px4-stop-when-not-ok', action='store_true',
+                   help='视觉 status≠ok 时发布零速度；默认关闭（非 ok 时仍前进，仅偏航角置 0）')
     return p.parse_args()
 
 
@@ -877,10 +772,9 @@ def run_image_mode(args):
 # ─── 实时相机模式 ──────────────────────────────────────────────────────────────
 
 def run_camera_mode(args):
-    """从摄像头读帧，实时输出偏航角；可选 MAVROS 定频发布 cmd_vel。"""
+    """从摄像头读帧，实时输出偏航角；可选 PX4 Offboard 20Hz 定频发布 setpoint。"""
     _rclpy = None
 
-    # 解析相机设备
     try:
         cam_id = int(args.camera)
     except ValueError:
@@ -893,51 +787,39 @@ def run_camera_mode(args):
     print(f"[信息] 相机已打开: {args.camera}")
     print(f"[信息] 按 Q/ESC 退出")
 
-    print("[信息] 加载分割模型（完成后若启用 MAVROS 再解锁/切 OFFBOARD）…")
+    print("[信息] 加载分割模型…")
     backend = _load_inference_backend(args)
 
     ros_node = None
     executor = None
     spin_thread = None
-    repeater = None
-    state_mon = None
+    px4_ctrl = None
     rclpy_initialized = False
 
-    if args.mavros:
+    if args.px4:
         import rclpy
         from rclpy.executors import MultiThreadedExecutor
 
         _rclpy = rclpy
         rclpy.init()
         rclpy_initialized = True
-        ros_node = rclpy.create_node('realtime_pilot_v4')
-        state_mon = _MavrosStateMonitor(ros_node, args.mavros_state_topic)
-        repeater = _MavrosCmdVelRepeater(
-            ros_node, args.mavros_topic, args.mavros_min_hz,
+        ros_node = rclpy.create_node('realtime_pilot_px4')
+
+        px4_ctrl = _PX4OffboardController(
+            ros_node,
+            stop_when_not_ok=args.px4_stop_when_not_ok,
         )
-        # 首帧推理前也发前进 setpoint，避免 OFFBOARD 预热阶段全是 0 速
-        repeater.update(
-            _twist_cmd_vel(args.mavros_linear_x, 0.0, args.mavros_max_wz),
-        )
+
         executor = MultiThreadedExecutor()
         executor.add_node(ros_node)
         spin_thread = threading.Thread(target=executor.spin, daemon=True)
         spin_thread.start()
         print(
-            f"[MAVROS] 话题={args.mavros_topic}  定频≥{args.mavros_min_hz} Hz "
-            f"linear.x={args.mavros_linear_x} m/s"
+            f"[PX4] Offboard 控制已启动  "
+            f"速度={_PX4OffboardController.FORWARD_SPEED} m/s  "
+            f"发布频率={_PX4OffboardController.CONTROL_HZ} Hz"
         )
-        print(
-            f"[MAVROS] state={args.mavros_state_topic} "
-            f"set_mode={args.mavros_set_mode_srv} arm={args.mavros_arm_srv}"
-        )
-        _mavros_set_offboard_and_arm(
-            ros_node,
-            state_mon,
-            args.mavros_prepare_delay,
-            args.mavros_set_mode_srv,
-            args.mavros_arm_srv,
-        )
+        print("[PX4] 发送 setpoint 中，1 秒后自动切 Offboard 并解锁…")
 
     yaw_filter = YawFilter(alpha=args.ema_alpha)
     input_h = args.input_size * 384 // 640
@@ -963,26 +845,9 @@ def run_camera_mode(args):
 
             yaw_deg = result['yaw_deg']
 
-            if repeater is not None:
-                # 默认：视觉非 ok 仍保持前进（wz=0），否则常见于水面反光/短暂的 boundary
-                # 检测失败时整船 linear.x 为 0，表现为「完全不前进」。
-                if result['status'] == 'ok':
-                    twist = _twist_cmd_vel(
-                        args.mavros_linear_x,
-                        yaw_deg,
-                        args.mavros_max_wz,
-                    )
-                elif args.mavros_stop_when_not_ok:
-                    twist = _twist_stop()
-                else:
-                    twist = _twist_cmd_vel(
-                        args.mavros_linear_x,
-                        0.0,
-                        args.mavros_max_wz,
-                    )
-                repeater.update(twist)
+            if px4_ctrl is not None:
+                px4_ctrl.update(yaw_deg, result['status'] == 'ok')
 
-            # 实时输出偏航角
             print(f"\r  帧#{frame_count:05d}  偏航角={yaw_deg:+6.1f}°  "
                   f"status={result['status']}",
                   end='', flush=True)
@@ -1020,10 +885,10 @@ def main():
         sys.exit("❌ --images 和 --camera 不能同时指定，请选择一种模式")
     if bool(args.model) == bool(args.engine):
         sys.exit("❌ 请二选一指定 --model 或 --engine")
-    if args.mavros and args.camera is None:
-        sys.exit("❌ --mavros 仅用于实时相机模式，请指定 --camera")
-    if args.mavros and args.images:
-        sys.exit("❌ --mavros 不能与 --images 同时使用")
+    if args.px4 and args.camera is None:
+        sys.exit("❌ --px4 仅用于实时相机模式，请指定 --camera")
+    if args.px4 and args.images:
+        sys.exit("❌ --px4 不能与 --images 同时使用")
 
     if args.images:
         run_image_mode(args)
