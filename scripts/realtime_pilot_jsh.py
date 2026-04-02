@@ -15,6 +15,27 @@
       --engine models/segformer_river/segformer_b0_640x384_fp16.engine \
       --px4
 
+速度限制，加速度限制，偏航角限制
+python scripts/realtime_pilot_jsh.py --camera /dev/video3 --engine models/segformer_river/segformer_b0_640x384_fp16.engine --px4 --px4-forward-speed 0.2 --px4-max-accel 0.08 --px4-max-yaw-rate-deg 12
+
+python scripts/realtime_pilot_jsh.py --camera /dev/video3 --engine models/segformer_river/segformer_b0_640x384_fp16.engine --px4 --px4-forward-speed 0.25 --px4-max-accel 0.08 --px4-yaw-gain 0.2 --px4-max-yaw-offset-deg 6 --px4-max-yaw-rate-deg 5
+
+
+记录日志
+python scripts/realtime_pilot_jsh.py \
+  --camera /dev/video3 \
+  --engine models/segformer_river/segformer_b0_640x384_fp16.engine \
+  --px4 \
+  --yaw-log debug/yaw_run_01.csv
+
+python scripts/realtime_pilot_jsh.py \
+  --camera /dev/video3 \
+  --engine models/segformer_river/segformer_b0_640x384_fp16.engine \
+  --px4 \
+  --yaw-log debug/yaw_run_02.csv \
+  --save-large-yaw-frames auto \
+  --large-yaw-threshold-deg 8
+
 【模型推理模式】对图片/目录进行推理：
   python scripts/realtime_pilot_jsh.py \
       --images dataset_final/images/test \
@@ -34,6 +55,7 @@
 
 import argparse
 from contextlib import nullcontext
+import csv
 import math
 import sys
 import threading
@@ -60,6 +82,112 @@ WIDTH_OUTLIER_TH = 0.4       # 航道宽度偏差超过此比例的行视为异�
 BOUNDARY_SMOOTH_WINDOW = 5   # 边界逐行平滑窗口
 CENTER_SMOOTH_WINDOW   = 7   # 中线 x 坐标平滑窗口
 POSTPROC_MASK_WIDTH    = 640 # 后处理计算宽度上限
+
+
+def _create_yaw_log_writer(log_path_arg: Optional[str], mode_name: str):
+    """创建偏航角日志 CSV，返回 (file_handle, csv_writer, path)。"""
+    if not log_path_arg:
+        return None, None, None
+
+    if log_path_arg.lower() == 'auto':
+        log_dir = Path('logs')
+        timestamp = time.strftime('%Y%m%d_%H%M%S')
+        log_path = log_dir / f'yaw_log_{mode_name}_{timestamp}.csv'
+    else:
+        log_path = Path(log_path_arg)
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = open(log_path, 'w', newline='')
+    writer = csv.writer(log_file)
+    writer.writerow([
+        'wall_time',
+        'frame',
+        'yaw_deg',
+        'status',
+        'n_filtered',
+        'center_count',
+        'path_count',
+        'px4_status_ok',
+        'px4_target_speed',
+        'px4_command_speed',
+        'px4_raw_yaw_deg',
+        'px4_target_yaw_deg',
+        'px4_command_yaw_deg',
+        'px4_absolute_yaw_deg',
+        'px4_velocity_x',
+        'px4_velocity_y',
+    ])
+    print(f'[信息] 偏航角日志已开启: {log_path}')
+    return log_file, writer, log_path
+
+
+def _write_yaw_log_row(
+    writer,
+    frame_index: int,
+    result: Dict[str, Any],
+    control_state: Optional[Dict[str, Any]] = None,
+) -> None:
+    if writer is None:
+        return
+    control_state = control_state or {}
+    writer.writerow([
+        f'{time.time():.3f}',
+        frame_index,
+        f"{float(result['yaw_deg']):.2f}",
+        result['status'],
+        int(result.get('n_filtered', 0)),
+        len(result.get('center_pts', [])),
+        len(result.get('path_pts', [])),
+        control_state.get('status_ok', ''),
+        _format_optional_float(control_state.get('target_speed')),
+        _format_optional_float(control_state.get('command_speed')),
+        _format_optional_float(control_state.get('raw_yaw_deg')),
+        _format_optional_float(control_state.get('target_yaw_deg')),
+        _format_optional_float(control_state.get('command_yaw_deg')),
+        _format_optional_float(control_state.get('absolute_yaw_deg')),
+        _format_optional_float(control_state.get('velocity_x')),
+        _format_optional_float(control_state.get('velocity_y')),
+    ])
+
+
+def _format_optional_float(value: Optional[float]) -> str:
+    if value is None:
+        return ''
+    return f'{float(value):.4f}'
+
+
+def _resolve_capture_dir(save_dir_arg: Optional[str], mode_name: str) -> Optional[Path]:
+    if not save_dir_arg:
+        return None
+    if save_dir_arg.lower() == 'auto':
+        timestamp = time.strftime('%Y%m%d_%H%M%S')
+        save_dir = Path('debug') / f'yaw_frames_{mode_name}_{timestamp}'
+    else:
+        save_dir = Path(save_dir_arg)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    print(f'[信息] 大偏航图像保存已开启: {save_dir}')
+    return save_dir
+
+
+def _maybe_save_yaw_frame(
+    save_dir: Optional[Path],
+    frame_index: int,
+    img_bgr: np.ndarray,
+    result: Dict[str, Any],
+    threshold_deg: float,
+    mode_name: str,
+) -> None:
+    if save_dir is None:
+        return
+    yaw_deg = float(result.get('yaw_deg', 0.0))
+    if abs(yaw_deg) < threshold_deg:
+        return
+
+    timestamp = time.strftime('%Y%m%d_%H%M%S')
+    yaw_tag = f'{yaw_deg:+06.2f}'.replace('+', 'p').replace('-', 'm')
+    status = str(result.get('status', 'unknown')).replace(' ', '_')
+    file_name = f'{mode_name}_frame_{frame_index:06d}_yaw_{yaw_tag}_{status}_{timestamp}.jpg'
+    cv2.imwrite(str(save_dir / file_name), img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
 
 
 def _load_inference_backend(args):
@@ -497,9 +625,22 @@ class _PX4OffboardController:
     """
 
     CONTROL_HZ = 20
-    FORWARD_SPEED = 0.1
+    DEFAULT_FORWARD_SPEED = 0.3
+    DEFAULT_MAX_ACCEL = 0.15
+    DEFAULT_MAX_YAW_RATE_DEG = 25.0
+    DEFAULT_YAW_GAIN = 0.35
+    DEFAULT_MAX_YAW_OFFSET_DEG = 12.0
 
-    def __init__(self, node, stop_when_not_ok: bool = False):
+    def __init__(
+        self,
+        node,
+        stop_when_not_ok: bool = False,
+        forward_speed: float = DEFAULT_FORWARD_SPEED,
+        max_accel: float = DEFAULT_MAX_ACCEL,
+        max_yaw_rate_deg: float = DEFAULT_MAX_YAW_RATE_DEG,
+        yaw_gain: float = DEFAULT_YAW_GAIN,
+        max_yaw_offset_deg: float = DEFAULT_MAX_YAW_OFFSET_DEG,
+    ):
         from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
         from px4_msgs.msg import (
             OffboardControlMode, TrajectorySetpoint, VehicleCommand, VehicleAttitude,
@@ -518,6 +659,24 @@ class _PX4OffboardController:
         self._current_yaw = 0.0
         self._status_ok = True
         self._stop_when_not_ok = stop_when_not_ok
+        self._target_forward_speed = max(0.0, float(forward_speed))
+        self._max_accel = max(0.0, float(max_accel))
+        self._max_yaw_rate_deg = max(0.0, float(max_yaw_rate_deg))
+        self._yaw_gain = max(0.0, float(yaw_gain))
+        self._max_yaw_offset_deg = max(0.0, float(max_yaw_offset_deg))
+        self._command_speed = 0.0
+        self._command_yaw_deg = 0.0
+        self._last_control_state = {
+            'status_ok': True,
+            'target_speed': 0.0,
+            'command_speed': 0.0,
+            'raw_yaw_deg': 0.0,
+            'target_yaw_deg': 0.0,
+            'command_yaw_deg': 0.0,
+            'absolute_yaw_deg': 0.0,
+            'velocity_x': 0.0,
+            'velocity_y': 0.0,
+        }
 
         self._offboard_setpoint_counter = 0
         self._armed = False
@@ -589,19 +748,40 @@ class _PX4OffboardController:
             status_ok = self._status_ok
 
         if not status_ok and self._stop_when_not_ok:
-            speed = 0.0
-            yaw_offset = 0.0
+            target_speed = 0.0
+            target_yaw_deg = 0.0
         elif not status_ok:
-            speed = self.FORWARD_SPEED
-            yaw_offset = 0.0
+            target_speed = self._target_forward_speed
+            target_yaw_deg = 0.0
         else:
-            speed = self.FORWARD_SPEED
-            yaw_offset = math.radians(yaw_deg)
+            target_speed = self._target_forward_speed
+            target_yaw_deg = yaw_deg * self._yaw_gain
+
+        target_yaw_deg = max(
+            -self._max_yaw_offset_deg,
+            min(self._max_yaw_offset_deg, target_yaw_deg),
+        )
+
+        speed = self._slew_value(
+            current_value=self._command_speed,
+            target_value=target_speed,
+            max_delta=self._max_accel / self.CONTROL_HZ,
+        )
+        yaw_deg_limited = self._slew_value(
+            current_value=self._command_yaw_deg,
+            target_value=target_yaw_deg,
+            max_delta=self._max_yaw_rate_deg / self.CONTROL_HZ,
+        )
+        self._command_speed = speed
+        self._command_yaw_deg = yaw_deg_limited
+        yaw_offset = math.radians(yaw_deg_limited)
 
         absolute_yaw = self._normalize_angle(current_yaw + yaw_offset)
+        velocity_x = speed * math.cos(absolute_yaw)
+        velocity_y = speed * math.sin(absolute_yaw)
 
-        msg.velocity[0] = speed * math.cos(absolute_yaw)
-        msg.velocity[1] = speed * math.sin(absolute_yaw)
+        msg.velocity[0] = velocity_x
+        msg.velocity[1] = velocity_y
         msg.velocity[2] = 0.0
         msg.position[0] = float('nan')
         msg.position[1] = float('nan')
@@ -611,11 +791,36 @@ class _PX4OffboardController:
         msg.acceleration[2] = float('nan')
         msg.yaw = absolute_yaw
         msg.yawspeed = float('nan')
+
+        with self._lock:
+            self._last_control_state = {
+                'status_ok': status_ok,
+                'target_speed': target_speed,
+                'command_speed': speed,
+                'raw_yaw_deg': yaw_deg,
+                'target_yaw_deg': target_yaw_deg,
+                'command_yaw_deg': yaw_deg_limited,
+                'absolute_yaw_deg': math.degrees(absolute_yaw),
+                'velocity_x': velocity_x,
+                'velocity_y': velocity_y,
+            }
+
         self._trajectory_pub.publish(msg)
 
     @staticmethod
     def _normalize_angle(angle: float) -> float:
         return math.atan2(math.sin(angle), math.cos(angle))
+
+    @staticmethod
+    def _slew_value(current_value: float, target_value: float, max_delta: float) -> float:
+        if max_delta <= 0.0:
+            return target_value
+        delta = target_value - current_value
+        if delta > max_delta:
+            return current_value + max_delta
+        if delta < -max_delta:
+            return current_value - max_delta
+        return target_value
 
     # ── VehicleCommand 发布 ──
 
@@ -653,6 +858,10 @@ class _PX4OffboardController:
             self._yaw_deg = yaw_deg
             self._status_ok = status_ok
 
+    def get_debug_state(self) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self._last_control_state)
+
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -688,12 +897,33 @@ def parse_args():
                    help='偏航角 EMA 滤波系数（0~1，越小越平滑），默认 0.3')
     p.add_argument('--roi-top',     type=float, default=0.1,
                    help='天空噪声截断比例，默认 0.1')
+    p.add_argument('--yaw-log', type=str, default=None,
+                   help='记录偏航角日志到 CSV；传 auto 自动保存到 logs/，也可直接给文件路径')
+    p.add_argument('--save-large-yaw-frames', type=str, default=None,
+                   help='保存大偏航原始图像；传 auto 自动保存到 debug/，也可直接给目录路径')
+    p.add_argument('--large-yaw-threshold-deg', type=float, default=8.0,
+                   help='触发保存原始图像的偏航角阈值 deg，默认 8')
 
     # PX4 Offboard 控制（仅实时相机模式）
     p.add_argument('--px4', action='store_true',
                    help='启用 PX4 Offboard 控制（通过 px4_msgs 直接通信，0.3 m/s 前进，20Hz 发布）')
     p.add_argument('--px4-stop-when-not-ok', action='store_true',
                    help='视觉 status≠ok 时发布零速度；默认关闭（非 ok 时仍前进，仅偏航角置 0）')
+    p.add_argument('--px4-forward-speed', type=float,
+                   default=_PX4OffboardController.DEFAULT_FORWARD_SPEED,
+                   help='PX4 前进目标速度 m/s，默认 0.3')
+    p.add_argument('--px4-max-accel', type=float,
+                   default=_PX4OffboardController.DEFAULT_MAX_ACCEL,
+                   help='PX4 速度变化上限 m/s^2，默认 0.15')
+    p.add_argument('--px4-max-yaw-rate-deg', type=float,
+                   default=_PX4OffboardController.DEFAULT_MAX_YAW_RATE_DEG,
+                   help='PX4 偏航角指令变化上限 deg/s，默认 25')
+    p.add_argument('--px4-yaw-gain', type=float,
+                   default=_PX4OffboardController.DEFAULT_YAW_GAIN,
+                   help='视觉偏航角缩放系数，默认 0.35；越小转向越柔和')
+    p.add_argument('--px4-max-yaw-offset-deg', type=float,
+                   default=_PX4OffboardController.DEFAULT_MAX_YAW_OFFSET_DEG,
+                   help='PX4 允许的最大偏航修正角 deg，默认 12')
     return p.parse_args()
 
 
@@ -723,6 +953,9 @@ def run_image_mode(args):
         csv_file = open(str(csv_path), 'w')
         csv_file.write('frame,yaw_deg,status\n')
 
+    yaw_log_file, yaw_log_writer, _ = _create_yaw_log_writer(args.yaw_log, 'images')
+    yaw_capture_dir = _resolve_capture_dir(args.save_large_yaw_frames, 'images')
+
     total = saved = ok = 0
     input_h = args.input_size * 384 // 640
 
@@ -750,6 +983,16 @@ def run_image_mode(args):
             if csv_file:
                 csv_file.write(f"{img_path.name},{yaw_deg:.2f},{result['status']}\n")
 
+            _write_yaw_log_row(yaw_log_writer, total, result)
+            _maybe_save_yaw_frame(
+                yaw_capture_dir,
+                total,
+                img_bgr,
+                result,
+                args.large_yaw_threshold_deg,
+                'images',
+            )
+
             if result['status'] == 'ok':
                 ok += 1
 
@@ -767,6 +1010,8 @@ def run_image_mode(args):
     finally:
         if csv_file:
             csv_file.close()
+        if yaw_log_file:
+            yaw_log_file.close()
         if args.show:
             cv2.destroyAllWindows()
 
@@ -804,6 +1049,8 @@ def run_video_mode(args):
 
     frame_count = 0
     ok_count = 0
+    yaw_log_file, yaw_log_writer, _ = _create_yaw_log_writer(args.yaw_log, 'video')
+    yaw_capture_dir = _resolve_capture_dir(args.save_large_yaw_frames, 'video')
 
     print(f"\n{'帧号':>6s}  {'警戒线数':>8s}  {'偏航角':>10s}  {'状态'}")
     print(f"{'-'*6}  {'-'*8}  {'-'*10}  {'-'*30}")
@@ -834,6 +1081,16 @@ def run_video_mode(args):
             if status == 'ok':
                 ok_count += 1
 
+            _write_yaw_log_row(yaw_log_writer, frame_count, result)
+            _maybe_save_yaw_frame(
+                yaw_capture_dir,
+                frame_count,
+                img_bgr,
+                result,
+                args.large_yaw_threshold_deg,
+                'video',
+            )
+
             print(f"  {frame_count:5d}  {n_boundary_lines:8d}  {yaw_deg:+9.2f}°  {status}")
 
             if args.show:
@@ -850,6 +1107,8 @@ def run_video_mode(args):
         print("\n[信息] Ctrl+C 退出")
     finally:
         cap.release()
+        if yaw_log_file:
+            yaw_log_file.close()
         if args.show:
             cv2.destroyAllWindows()
 
@@ -899,6 +1158,11 @@ def run_camera_mode(args):
         px4_ctrl = _PX4OffboardController(
             ros_node,
             stop_when_not_ok=args.px4_stop_when_not_ok,
+            forward_speed=args.px4_forward_speed,
+            max_accel=args.px4_max_accel,
+            max_yaw_rate_deg=args.px4_max_yaw_rate_deg,
+            yaw_gain=args.px4_yaw_gain,
+            max_yaw_offset_deg=args.px4_max_yaw_offset_deg,
         )
 
         executor = MultiThreadedExecutor()
@@ -907,13 +1171,19 @@ def run_camera_mode(args):
         spin_thread.start()
         print(
             f"[PX4] Offboard 控制已启动  "
-            f"速度={_PX4OffboardController.FORWARD_SPEED} m/s  "
+            f"速度={args.px4_forward_speed} m/s  "
+            f"最大加速度={args.px4_max_accel} m/s^2  "
+            f"偏航增益={args.px4_yaw_gain}  "
+            f"最大偏航修正={args.px4_max_yaw_offset_deg} deg  "
+            f"最大偏航变化率={args.px4_max_yaw_rate_deg} deg/s  "
             f"发布频率={_PX4OffboardController.CONTROL_HZ} Hz"
         )
         print("[PX4] 发送 setpoint 中，1 秒后自动切 Offboard 并解锁…")
 
     yaw_filter = YawFilter(alpha=args.ema_alpha)
     input_h = args.input_size * 384 // 640
+    yaw_log_file, yaw_log_writer, _ = _create_yaw_log_writer(args.yaw_log, 'camera')
+    yaw_capture_dir = _resolve_capture_dir(args.save_large_yaw_frames, 'camera')
 
     frame_count = 0
     try:
@@ -939,6 +1209,17 @@ def run_camera_mode(args):
             if px4_ctrl is not None:
                 px4_ctrl.update(yaw_deg, result['status'] == 'ok')
 
+            control_state = px4_ctrl.get_debug_state() if px4_ctrl is not None else None
+            _write_yaw_log_row(yaw_log_writer, frame_count, result, control_state=control_state)
+            _maybe_save_yaw_frame(
+                yaw_capture_dir,
+                frame_count,
+                img_bgr,
+                result,
+                args.large_yaw_threshold_deg,
+                'camera',
+            )
+
             print(f"\r  帧#{frame_count:05d}  偏航角={yaw_deg:+6.1f}°  "
                   f"status={result['status']}",
                   end='', flush=True)
@@ -953,6 +1234,8 @@ def run_camera_mode(args):
         print("\n[信息] Ctrl+C 退出")
     finally:
         cap.release()
+        if yaw_log_file:
+            yaw_log_file.close()
         if args.show:
             cv2.destroyAllWindows()
         if rclpy_initialized and _rclpy is not None:
