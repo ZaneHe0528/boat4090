@@ -11,7 +11,7 @@
 
 【PX4 Offboard 控制】0.3 m/s 前进，20Hz 发布 setpoint，1 秒预热后自动解锁：
   python scripts/realtime_pilot_jsh.py \
-      --camera /dev/video2 \
+      --camera /dev/video3 \
       --engine models/segformer_river/segformer_b0_640x384_fp16.engine \
       --px4
 
@@ -23,7 +23,12 @@
 
 【实时相机模式】从摄像头读帧，实时输出偏航角：
   python scripts/realtime_pilot_jsh.py \
-      --camera /dev/video2 \
+      --camera /dev/video3 \
+      --engine models/segformer_river/segformer_b0_640x384_fp16.engine
+
+【离线视频测试】读取视频文件，逐帧推理，输出警戒线数量和偏航角：
+  python scripts/realtime_pilot_jsh.py \
+      --video video528.mp4 \
       --engine models/segformer_river/segformer_b0_640x384_fp16.engine
 """
 
@@ -492,7 +497,7 @@ class _PX4OffboardController:
     """
 
     CONTROL_HZ = 20
-    FORWARD_SPEED = 0.3
+    FORWARD_SPEED = 0.1
 
     def __init__(self, node, stop_when_not_ok: bool = False):
         from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
@@ -668,6 +673,10 @@ def parse_args():
     p.add_argument('--camera',      default=None,
                    help='相机设备编号或路径（实时模式），如 0 或 /dev/video0')
 
+    # 离线视频测试模式
+    p.add_argument('--video',       default=None,
+                   help='离线视频文件路径（视频测试模式），如 video528.mp4')
+
     p.add_argument('--show',        action='store_true', help='弹窗显示（按 Q/ESC 退出）')
     p.add_argument('--num-classes', type=int, default=3,
                    help='分割类别数，默认 3')
@@ -766,6 +775,88 @@ def run_image_mode(args):
     if out_dir:
         print(f"  偏航角已导出: {out_dir / 'yaw_angle.csv'}")
     print(f"  输出格式: yaw_deg = 偏航角（度），+右偏 -左偏，0=正前方")
+    print(f"{'='*60}")
+
+
+# ─── 离线视频测试模式 ──────────────────────────────────────────────────────────
+
+def run_video_mode(args):
+    """读取离线视频文件，逐帧推理，在终端输出警戒线数量和偏航角。"""
+    video_path = args.video
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        sys.exit(f"❌ 无法打开视频文件: {video_path}")
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    print(f"{'='*60}")
+    print(f"  离线视频测试模式")
+    print(f"  视频文件: {video_path}")
+    print(f"  分辨率: {width}x{height}  帧率: {fps:.1f}  总帧数: {total_frames}")
+    print(f"{'='*60}")
+
+    backend = _load_inference_backend(args)
+    yaw_filter = YawFilter(alpha=args.ema_alpha)
+    input_h = args.input_size * 384 // 640
+
+    frame_count = 0
+    ok_count = 0
+
+    print(f"\n{'帧号':>6s}  {'警戒线数':>8s}  {'偏航角':>10s}  {'状态'}")
+    print(f"{'-'*6}  {'-'*8}  {'-'*10}  {'-'*30}")
+
+    try:
+        while True:
+            ret, img_bgr = cap.read()
+            if not ret:
+                break
+
+            frame_count += 1
+
+            mask = _infer_mask_with_backend(backend, args, img_bgr, input_h)
+
+            proc_mask, _, _ = _prepare_postprocess_mask(mask)
+            polylines, _ = extract_boundary_polylines(proc_mask)
+            n_boundary_lines = len(polylines)
+
+            _, result = process_frame(
+                img_bgr, mask,
+                yaw_filter=yaw_filter,
+                roi_top_ratio=args.roi_top,
+            )
+
+            yaw_deg = result['yaw_deg']
+            status = result['status']
+
+            if status == 'ok':
+                ok_count += 1
+
+            print(f"  {frame_count:5d}  {n_boundary_lines:8d}  {yaw_deg:+9.2f}°  {status}")
+
+            if args.show:
+                info_text = f"Frame:{frame_count} Lines:{n_boundary_lines} Yaw:{yaw_deg:+.1f}"
+                cv2.putText(img_bgr, info_text, (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                cv2.imshow("离线视频测试 (Q/ESC 退出)", img_bgr)
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord('q'), ord('Q'), 27):
+                    print("\n[信息] 用户退出")
+                    break
+
+    except KeyboardInterrupt:
+        print("\n[信息] Ctrl+C 退出")
+    finally:
+        cap.release()
+        if args.show:
+            cv2.destroyAllWindows()
+
+    print(f"\n{'='*60}")
+    print(f"  总帧数: {frame_count}")
+    print(f"  有效导航帧(status=ok): {ok_count}")
+    print(f"  有效率: {ok_count/max(frame_count,1)*100:.1f}%")
     print(f"{'='*60}")
 
 
@@ -881,21 +972,28 @@ def run_camera_mode(args):
 def main():
     args = parse_args()
 
-    if args.images and args.camera:
-        sys.exit("❌ --images 和 --camera 不能同时指定，请选择一种模式")
+    mode_count = sum([
+        bool(args.images),
+        bool(args.camera),
+        bool(args.video),
+    ])
+    if mode_count > 1:
+        sys.exit("❌ --images / --camera / --video 只能指定一种模式")
     if bool(args.model) == bool(args.engine):
         sys.exit("❌ 请二选一指定 --model 或 --engine")
     if args.px4 and args.camera is None:
         sys.exit("❌ --px4 仅用于实时相机模式，请指定 --camera")
-    if args.px4 and args.images:
-        sys.exit("❌ --px4 不能与 --images 同时使用")
+    if args.px4 and (args.images or args.video):
+        sys.exit("❌ --px4 不能与 --images / --video 同时使用")
 
     if args.images:
         run_image_mode(args)
+    elif args.video:
+        run_video_mode(args)
     elif args.camera is not None:
         run_camera_mode(args)
     else:
-        sys.exit("❌ 请指定 --images（模型推理模式）或 --camera（实时相机模式）")
+        sys.exit("❌ 请指定 --images（模型推理）/ --camera（实时相机）/ --video（离线视频测试）")
 
 
 if __name__ == '__main__':
