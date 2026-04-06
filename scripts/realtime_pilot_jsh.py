@@ -48,9 +48,10 @@ python scripts/realtime_pilot_jsh.py \
       --engine models/segformer_river/segformer_b0_640x384_fp16.engine
 
 【离线视频测试】读取视频文件，逐帧推理，输出警戒线数量和偏航角：
-  python scripts/realtime_pilot_jsh.py \
-      --video video528.mp4 \
-      --engine models/segformer_river/segformer_b0_640x384_fp16.engine
+python scripts/realtime_pilot_jsh.py \
+    --video video528.mp4 \
+    --engine models/segformer_river/segformer_b0_640x384_fp16.engine \
+    --save-video auto
 """
 
 import argparse
@@ -79,8 +80,8 @@ MIN_AREA   = 30              # 连通域最少像素数，过滤噪声
 
 ROI_TOP_RATIO    = 0.1       # 去除图像最顶部比例（天空噪声）
 WIDTH_OUTLIER_TH = 0.4       # 航道宽度偏差超过此比例的行视为异常
-BOUNDARY_SMOOTH_WINDOW = 5   # 边界逐行平滑窗口
-CENTER_SMOOTH_WINDOW   = 7   # 中线 x 坐标平滑窗口
+BOUNDARY_SMOOTH_WINDOW = 11  # 边界逐行平滑窗口（从 5 → 11，减少源头噪声）
+CENTER_SMOOTH_WINDOW   = 31  # 中线 x 坐标平滑窗口（从 7 → 31，更强的平滑）
 POSTPROC_MASK_WIDTH    = 640 # 后处理计算宽度上限
 
 
@@ -167,6 +168,78 @@ def _resolve_capture_dir(save_dir_arg: Optional[str], mode_name: str) -> Optiona
     save_dir.mkdir(parents=True, exist_ok=True)
     print(f'[信息] 大偏航图像保存已开启: {save_dir}')
     return save_dir
+
+
+def _draw_navigation_overlay(
+    img_bgr: np.ndarray,
+    polylines: List[List[Tuple[int, int]]],
+    result: Dict[str, Any],
+    boundary_scale_x: float = 1.0,
+    boundary_scale_y: float = 1.0,
+    pts_scale_x: float = 1.0,
+    pts_scale_y: float = 1.0,
+) -> np.ndarray:
+    """在图像上绘制边界线、中心线、航行路径和偏航角指示，用于离线验证。
+
+    Args:
+        boundary_scale_x/y: polylines 坐标（proc_mask 空间）→ 原图的缩放系数
+        pts_scale_x/y:      center_pts / path_pts（mask 空间）→ 原图的缩放系数
+    """
+    vis = img_bgr.copy()
+    h, w = vis.shape[:2]
+
+    def _to_img_boundary(pts):
+        return [(int(round(x * boundary_scale_x)),
+                 int(round(y * boundary_scale_y))) for x, y in pts]
+
+    def _to_img_pts(pts):
+        return [(int(round(x * pts_scale_x)),
+                 int(round(y * pts_scale_y))) for x, y in pts]
+
+    colors_boundary = [(0, 200, 255), (255, 200, 0)]  # 左=橙黄, 右=青蓝
+    for i, pts in enumerate(polylines):
+        if len(pts) < 2:
+            continue
+        scaled = _to_img_boundary(pts)
+        color = colors_boundary[i % 2]
+        arr = np.array(scaled, dtype=np.int32)
+        cv2.polylines(vis, [arr], False, color, 2, cv2.LINE_AA)
+
+    center_pts = result.get('center_pts', [])
+    if len(center_pts) >= 2:
+        scaled = _to_img_pts(center_pts)
+        arr = np.array(scaled, dtype=np.int32)
+        cv2.polylines(vis, [arr], False, (0, 255, 0), 2, cv2.LINE_AA)
+
+    path_pts = result.get('path_pts', [])
+    if len(path_pts) >= 2:
+        scaled = _to_img_pts(path_pts)
+        arr = np.array(scaled, dtype=np.int32)
+        cv2.polylines(vis, [arr], False, (0, 0, 255), 3, cv2.LINE_AA)
+        cv2.circle(vis, scaled[0], 6, (0, 0, 255), -1)
+
+    yaw_deg = float(result.get('yaw_deg', 0.0))
+    status = result.get('status', '')
+    boat_x, boat_y = w // 2, h - 1
+    arrow_len = int(h * 0.25)
+    angle_rad = math.radians(yaw_deg)
+    tip_x = int(boat_x + arrow_len * math.sin(angle_rad))
+    tip_y = int(boat_y - arrow_len * math.cos(angle_rad))
+    cv2.arrowedLine(vis, (boat_x, boat_y), (tip_x, tip_y),
+                    (255, 255, 255), 3, cv2.LINE_AA, tipLength=0.15)
+    ref_tip_y = boat_y - arrow_len
+    cv2.arrowedLine(vis, (boat_x, boat_y), (boat_x, ref_tip_y),
+                    (128, 128, 128), 1, cv2.LINE_AA, tipLength=0.15)
+
+    label = f"Yaw: {yaw_deg:+.2f} deg  Status: {status}"
+    cv2.putText(vis, label, (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+
+    n_bnd = len(polylines)
+    cv2.putText(vis, f"Boundaries: {n_bnd}", (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2, cv2.LINE_AA)
+
+    return vis
 
 
 def _maybe_save_yaw_frame(
@@ -330,7 +403,7 @@ def _smooth_centerline_points(
     center_pts: List[Tuple[int, int]],
     window: int = CENTER_SMOOTH_WINDOW,
 ) -> List[Tuple[int, int]]:
-    """仅平滑 x 坐标，避免每帧运行 SciPy 样条。"""
+    """用高斯加权平滑 x 坐标，比 box filter 有更好的平滑效果且不会产生鬼影。"""
     if len(center_pts) < 3:
         return center_pts
 
@@ -344,9 +417,9 @@ def _smooth_centerline_points(
         return center_pts
 
     pad = k // 2
-    kernel = np.ones(k, dtype=np.float32) / float(k)
+    gaussian_kernel = cv2.getGaussianKernel(k, 0).flatten().astype(np.float32)
     xs_pad = np.pad(xs, (pad, pad), mode='edge')
-    xs_smooth = np.convolve(xs_pad, kernel, mode='valid')
+    xs_smooth = np.convolve(xs_pad, gaussian_kernel, mode='valid')
     return [(int(round(float(x))), y) for x, y in zip(xs_smooth, ys)]
 
 
@@ -574,6 +647,15 @@ def process_frame(
             for y in sorted(valid_ys, reverse=True)
         ]
 
+        # ── 6.5. 对 center_pts 的间隙用线性插值填充，使其成为逐行连续 ──
+        if len(center_pts) >= 2:
+            ys_asc = np.array([pt[1] for pt in reversed(center_pts)], dtype=np.int32)
+            xs_asc = np.array([pt[0] for pt in reversed(center_pts)], dtype=np.float32)
+            all_ys_dense = np.arange(ys_asc[0], ys_asc[-1] + 1, dtype=np.int32)
+            xs_interp = np.interp(all_ys_dense, ys_asc, xs_asc)
+            center_pts = [(int(round(float(x))), int(y))
+                          for x, y in zip(xs_interp[::-1], all_ys_dense[::-1])]
+
         # ── 7. 轻量平滑中线 ──
         center_pts = _smooth_centerline_points(center_pts)
 
@@ -665,7 +747,8 @@ class _PX4OffboardController:
         self._yaw_gain = max(0.0, float(yaw_gain))
         self._max_yaw_offset_deg = max(0.0, float(max_yaw_offset_deg))
         self._command_speed = 0.0
-        self._command_yaw_deg = 0.0
+        self._target_absolute_yaw = None
+        self._command_absolute_yaw = None
         self._last_control_state = {
             'status_ok': True,
             'target_speed': 0.0,
@@ -746,37 +829,45 @@ class _PX4OffboardController:
             current_yaw = self._current_yaw
             yaw_deg = self._yaw_deg
             status_ok = self._status_ok
+            target_abs_yaw = self._target_absolute_yaw
+
+        if self._command_absolute_yaw is None:
+            self._command_absolute_yaw = current_yaw
 
         if not status_ok and self._stop_when_not_ok:
             target_speed = 0.0
-            target_yaw_deg = 0.0
+            target_abs_yaw = current_yaw
         elif not status_ok:
             target_speed = self._target_forward_speed
-            target_yaw_deg = 0.0
+            target_abs_yaw = current_yaw
         else:
             target_speed = self._target_forward_speed
-            target_yaw_deg = yaw_deg * self._yaw_gain
 
-        target_yaw_deg = max(
-            -self._max_yaw_offset_deg,
-            min(self._max_yaw_offset_deg, target_yaw_deg),
-        )
+        if target_abs_yaw is None:
+            target_abs_yaw = current_yaw
 
         speed = self._slew_value(
             current_value=self._command_speed,
             target_value=target_speed,
             max_delta=self._max_accel / self.CONTROL_HZ,
         )
-        yaw_deg_limited = self._slew_value(
-            current_value=self._command_yaw_deg,
-            target_value=target_yaw_deg,
-            max_delta=self._max_yaw_rate_deg / self.CONTROL_HZ,
-        )
         self._command_speed = speed
-        self._command_yaw_deg = yaw_deg_limited
-        yaw_offset = math.radians(yaw_deg_limited)
 
-        absolute_yaw = self._normalize_angle(current_yaw + yaw_offset)
+        max_yaw_step = math.radians(self._max_yaw_rate_deg) / self.CONTROL_HZ
+        absolute_yaw = self._slew_angle(
+            self._command_absolute_yaw, target_abs_yaw, max_yaw_step,
+        )
+        self._command_absolute_yaw = absolute_yaw
+
+        target_offset_deg = math.degrees(math.atan2(
+            math.sin(target_abs_yaw - current_yaw),
+            math.cos(target_abs_yaw - current_yaw),
+        ))
+        command_offset_deg = math.degrees(math.atan2(
+            math.sin(absolute_yaw - current_yaw),
+            math.cos(absolute_yaw - current_yaw),
+        ))
+
         velocity_x = speed * math.cos(absolute_yaw)
         velocity_y = speed * math.sin(absolute_yaw)
 
@@ -798,8 +889,8 @@ class _PX4OffboardController:
                 'target_speed': target_speed,
                 'command_speed': speed,
                 'raw_yaw_deg': yaw_deg,
-                'target_yaw_deg': target_yaw_deg,
-                'command_yaw_deg': yaw_deg_limited,
+                'target_yaw_deg': target_offset_deg,
+                'command_yaw_deg': command_offset_deg,
                 'absolute_yaw_deg': math.degrees(absolute_yaw),
                 'velocity_x': velocity_x,
                 'velocity_y': velocity_y,
@@ -821,6 +912,18 @@ class _PX4OffboardController:
         if delta < -max_delta:
             return current_value - max_delta
         return target_value
+
+    @staticmethod
+    def _slew_angle(current: float, target: float, max_delta: float) -> float:
+        """Rate-limit an angle value, correctly handling ±pi wrapping."""
+        if max_delta <= 0.0:
+            return target
+        diff = math.atan2(math.sin(target - current), math.cos(target - current))
+        if abs(diff) <= max_delta:
+            return target
+        return _PX4OffboardController._normalize_angle(
+            current + math.copysign(max_delta, diff)
+        )
 
     # ── VehicleCommand 发布 ──
 
@@ -857,6 +960,12 @@ class _PX4OffboardController:
         with self._lock:
             self._yaw_deg = yaw_deg
             self._status_ok = status_ok
+            offset_deg = yaw_deg * self._yaw_gain
+            offset_deg = max(-self._max_yaw_offset_deg,
+                             min(self._max_yaw_offset_deg, offset_deg))
+            self._target_absolute_yaw = self._normalize_angle(
+                self._current_yaw + math.radians(offset_deg)
+            )
 
     def get_debug_state(self) -> Dict[str, Any]:
         with self._lock:
@@ -903,6 +1012,9 @@ def parse_args():
                    help='保存大偏航原始图像；传 auto 自动保存到 debug/，也可直接给目录路径')
     p.add_argument('--large-yaw-threshold-deg', type=float, default=8.0,
                    help='触发保存原始图像的偏航角阈值 deg，默认 8')
+    p.add_argument('--save-video', type=str, default=None,
+                   help='将带标注的可视化视频保存到指定路径（仅离线视频模式），'
+                        '如 output_vis.mp4；传 auto 则自动命名')
 
     # PX4 Offboard 控制（仅实时相机模式）
     p.add_argument('--px4', action='store_true',
@@ -1052,6 +1164,27 @@ def run_video_mode(args):
     yaw_log_file, yaw_log_writer, _ = _create_yaw_log_writer(args.yaw_log, 'video')
     yaw_capture_dir = _resolve_capture_dir(args.save_large_yaw_frames, 'video')
 
+    video_writer = None
+    save_video_path = None
+    if args.save_video:
+        if args.save_video.lower() == 'auto':
+            timestamp = time.strftime('%Y%m%d_%H%M%S')
+            src_name = Path(video_path).stem
+            save_video_path = f'debug/{src_name}_vis_{timestamp}.mp4'
+        else:
+            save_video_path = args.save_video
+        Path(save_video_path).parent.mkdir(parents=True, exist_ok=True)
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        video_writer = cv2.VideoWriter(save_video_path, fourcc, fps, (width, height))
+        print(f"[信息] 标注视频将保存至: {save_video_path}")
+
+    need_vis = args.show or video_writer is not None
+
+    mask_w = args.input_size
+    mask_h = input_h
+    img_to_mask_x = float(width) / float(mask_w)
+    img_to_mask_y = float(height) / float(mask_h)
+
     print(f"\n{'帧号':>6s}  {'警戒线数':>8s}  {'偏航角':>10s}  {'状态'}")
     print(f"{'-'*6}  {'-'*8}  {'-'*10}  {'-'*30}")
 
@@ -1065,7 +1198,7 @@ def run_video_mode(args):
 
             mask = _infer_mask_with_backend(backend, args, img_bgr, input_h)
 
-            proc_mask, _, _ = _prepare_postprocess_mask(mask)
+            proc_mask, sx, sy = _prepare_postprocess_mask(mask)
             polylines, _ = extract_boundary_polylines(proc_mask)
             n_boundary_lines = len(polylines)
 
@@ -1093,20 +1226,34 @@ def run_video_mode(args):
 
             print(f"  {frame_count:5d}  {n_boundary_lines:8d}  {yaw_deg:+9.2f}°  {status}")
 
-            if args.show:
-                info_text = f"Frame:{frame_count} Lines:{n_boundary_lines} Yaw:{yaw_deg:+.1f}"
-                cv2.putText(img_bgr, info_text, (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                cv2.imshow("离线视频测试 (Q/ESC 退出)", img_bgr)
-                key = cv2.waitKey(1) & 0xFF
-                if key in (ord('q'), ord('Q'), 27):
-                    print("\n[信息] 用户退出")
-                    break
+            if need_vis:
+                vis = _draw_navigation_overlay(
+                    img_bgr, polylines, result,
+                    boundary_scale_x=sx * img_to_mask_x,
+                    boundary_scale_y=sy * img_to_mask_y,
+                    pts_scale_x=img_to_mask_x,
+                    pts_scale_y=img_to_mask_y,
+                )
+                frame_label = f"Frame: {frame_count}/{total_frames}"
+                cv2.putText(vis, frame_label, (10, vis.shape[0] - 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv2.LINE_AA)
+
+                if video_writer is not None:
+                    video_writer.write(vis)
+
+                if args.show:
+                    cv2.imshow("离线视频测试 (Q/ESC 退出)", vis)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key in (ord('q'), ord('Q'), 27):
+                        print("\n[信息] 用户退出")
+                        break
 
     except KeyboardInterrupt:
         print("\n[信息] Ctrl+C 退出")
     finally:
         cap.release()
+        if video_writer is not None:
+            video_writer.release()
         if yaw_log_file:
             yaw_log_file.close()
         if args.show:
@@ -1116,6 +1263,8 @@ def run_video_mode(args):
     print(f"  总帧数: {frame_count}")
     print(f"  有效导航帧(status=ok): {ok_count}")
     print(f"  有效率: {ok_count/max(frame_count,1)*100:.1f}%")
+    if save_video_path:
+        print(f"  标注视频已保存: {save_video_path}")
     print(f"{'='*60}")
 
 
